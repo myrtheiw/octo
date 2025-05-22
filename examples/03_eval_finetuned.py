@@ -17,6 +17,8 @@ To run this script, run:
 """
 from functools import partial
 import sys
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 from absl import app, flags, logging
 import gym
@@ -24,7 +26,7 @@ import jax
 import numpy as np
 import wandb
 
-sys.path.append("path/to/your/act")
+sys.path.append("/home/myrtheiw/octo_ws/act")
 
 # keep this to register ALOHA sim env
 from envs.aloha_sim_env import AlohaGymEnv  # noqa
