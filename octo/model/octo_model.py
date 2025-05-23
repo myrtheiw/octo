@@ -139,7 +139,9 @@ class OctoModel:
         tasks: Data,
         timestep_pad_mask: ArrayLike,
         train: bool = False,
+        rng: Optional[PRNGKey] = None,
     ):
+
         """Runs the transformer, but does shape checking on the inputs.
 
         Args:
@@ -165,12 +167,14 @@ class OctoModel:
             timestep_pad_mask,
             train=train,
             method="octo_transformer",
+            rngs={"dropout": rng} if train and rng is not None else None,
         )
 
-    @partial(
-        jax.jit,
-        static_argnames=("train", "sample_shape", "argmax"),
-    )
+
+    # @partial(
+    #     jax.jit,
+    #     static_argnames=("train", "sample_shape", "argmax"),
+    # )
     def sample_actions(
         self,
         observations: Data,
@@ -200,13 +204,15 @@ class OctoModel:
         """
         if timestep_pad_mask is None:
             timestep_pad_mask = observations["timestep_pad_mask"]
-
+            
         transformer_outputs = self.run_transformer(
-            observations, tasks, timestep_pad_mask, train=train
+            observations, tasks, timestep_pad_mask, train=train, rng=rng
         )
-        action_head: ActionHead = self.module.bind({"params": self.params}).heads[
-            "action"
-        ]
+
+        action_head: ActionHead = self.module.bind(
+            {"params": self.params}, rngs={"dropout": rng} if train and rng is not None else None
+        ).heads["action"]
+
         action = action_head.predict_action(
             transformer_outputs,
             train=train,
