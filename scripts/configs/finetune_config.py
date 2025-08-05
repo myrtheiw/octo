@@ -4,6 +4,8 @@ from ml_collections.config_dict import FieldReference, placeholder
 from octo.utils.spec import ModuleSpec
 
 
+
+
 def get_config(config_string="full,multimodal"):
     mode, task = config_string.split(",")
     assert task in ["image_conditioned", "language_conditioned", "multimodal"]
@@ -16,23 +18,40 @@ def get_config(config_string="full,multimodal"):
     # and second image key should be the wrist view (None if not used)
 
     FINETUNING_KWARGS = {
-        "name": "bridge_dataset",
-        "data_dir": "./tests/debug_dataset",
-        "image_obs_keys": {"primary": "image_0", "wrist": None},
+        "name": "blokje_robotics",  # Name should match your TFDS dataset
+        "data_dir": "/home/myrtheiw/tensorflow_datasets",  # Top-level TFDS path
+        "image_obs_keys": {"primary": "agentview", "wrist": "eye_in_hand"},
         "proprio_obs_key": "proprio",
-        "language_key": "language_instruction",
+        "language_key": "language_instruction", 
         "action_proprio_normalization_type": "normal",
-        # We want to avoid normalizing the gripper
         "action_normalization_mask": [True, True, True, True, True, True, False],
-        # standardize_fn is dynamically loaded from a file
-        # for example: "experiments/kevin/custom_standardization_transforms.py:aloha_dataset_transform"
         "standardize_fn": ModuleSpec.create(
-            "octo.data.oxe.oxe_standardization_transforms:bridge_dataset_transform",
+            "octo.data.oxe.oxe_standardization_transforms:blokje_robotics_dataset_transform"
         ),
-        # If the default data loading speed is too slow, try these:
-        # "num_parallel_reads": 8,  # for reading from disk / GCS
-        # "num_parallel_calls": 16,  # for initial dataset construction
+
+        # Optional speed tuning
+        # "num_parallel_reads": 8,
+        # "num_parallel_calls": 16,
     }
+
+    # FINETUNING_KWARGS = {
+    #     "name": "bridge_dataset",
+    #     "data_dir": "./tests/debug_dataset",
+    #     "image_obs_keys": {"primary": "image_0", "wrist": None},
+    #     "proprio_obs_key": "proprio",
+    #     "language_key": "language_instruction",
+    #     "action_proprio_normalization_type": "normal",
+    #     # We want to avoid normalizing the gripper
+    #     "action_normalization_mask": [True, True, True, True, True, True, False],
+    #     # standardize_fn is dynamically loaded from a file
+    #     # for example: "experiments/kevin/custom_standardization_transforms.py:aloha_dataset_transform"
+    #     "standardize_fn": ModuleSpec.create(
+    #         "octo.data.oxe.oxe_standardization_transforms:bridge_dataset_transform",
+    #     ),
+    #     # If the default data loading speed is too slow, try these:
+    #     # "num_parallel_reads": 8,  # for reading from disk / GCS
+    #     # "num_parallel_calls": 16,  # for initial dataset construction
+    # }
 
     if mode == "full":
         frozen_keys = None
