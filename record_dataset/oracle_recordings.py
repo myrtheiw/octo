@@ -22,6 +22,13 @@ import os
 import numpy as np
 import tensorflow as tf
 import mujoco
+import envlogger
+from envlogger.backends import tfds_backend_writer
+import tensorflow_datasets as tfds
+import dm_env
+from dm_env import specs, TimeStep
+
+from path_planning.plan_to_tomato import plan_joint_traj_to_tomato
 
 # ------------------------------- Config ---------------------------------------
 
@@ -51,8 +58,131 @@ IK_ORI_TOL   = 1e-3     # rad; used if USE_ORIENTATION
 # Planning & recording
 N_CART_WAYPOINTS = 30
 EP_LENGTH        = 400
-REC_PATH         = "/home/myrtheiw/octo_ws/octo/record_dataset/tomato_dataset.tfrecord"
+REC_PATH         = "/home/myrtheiw/octo_ws/octo/record_dataset/dataset/tomato_dataset.tfrecord"
 
+IMG_H, IMG_W = 256, 256   # image size for both cameras
+PRIMARY_CAM_NAME = "third_person_cam"
+WRIST_CAM_NAME   = "gripper_cam"
+
+# ---------------- Setup Envlogger ----------------
+
+class PandaOracleEnv(dm_env.Environment):
+    """dm_env wrapper around your MuJoCo Panda + oracle controller."""
+    def __init__(self, model, data, arm_act_ids, arm_qpos_addr, arm_dof_idx,
+                 ee_ref, language_instruction, kp=300.0, kd=10.0,
+                 torque_mode=True, gripper_idx=-1): 
+        self.model = model; self.data = data
+        self.arm_act_ids = arm_act_ids
+        self.arm_qpos_addr = arm_qpos_addr
+        self.arm_dof_idx = arm_dof_idx
+        self.ee_ref = ee_ref
+        self.lang = language_instruction
+        self.kp = kp; self.kd = kd
+        self.torque_mode = torque_mode
+        self._waypoints = None
+        self._T = 0
+        self._t = 0
+        self.gripper_idx = gripper_idx
+        self.cam_primary = PRIMARY_CAM_NAME
+        self.cam_wrist   = WRIST_CAM_NAME
+        # Reuse persistent GL contexts (faster than recreating)
+        self._r_primary = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
+        self._r_wrist   = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
+
+
+    def reset(self, waypoints=None):
+        """Reset sim. If waypoints provided, load them; otherwise keep current waypoints."""
+        self._t = 0
+        if waypoints is not None:
+            self._waypoints = waypoints.astype(np.float32)
+            self._T = len(waypoints)
+        # else: keep previously set self._waypoints / self._T as-is
+
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+        img_primary, img_wrist = self._render_images()
+        return TimeStep(
+            dm_env.StepType.FIRST,
+            reward=np.float32(0.0),
+            discount=np.float32(1.0),
+            observation={
+                "state": self.data.qpos.astype(np.float32).copy(),
+                "language_instruction": self.lang,
+                "image_primary": img_primary,     # <— NEW
+                "image_wrist": img_wrist,         # <— NEW
+            },
+        )
+
+
+
+
+    def step(self, action):
+        if self._waypoints is None or self._T == 0:
+            raise RuntimeError("PandaOracleEnv.step() called before reset(waypoints=...)")
+    
+        # Drive sim using oracle’s PD to track current waypoint, but *log* the applied action you pass in.
+        idx = min(self._t, self._T - 1)
+        q_target = self._waypoints[idx, :7]
+        g_cmd    = self._waypoints[idx,  7]
+
+        q_cur  = self.data.qpos[self.arm_qpos_addr]
+        qd_cur = self.data.qvel[self.arm_dof_idx]
+        tau    = self.kp*(q_target - q_cur) - self.kd*qd_cur
+
+        if self.torque_mode:
+            self.data.ctrl[self.arm_act_ids] = tau
+        else:
+            self.data.ctrl[self.arm_act_ids] = q_target
+        if 0 <= self.gripper_idx < self.model.nu:
+            self.data.ctrl[self.gripper_idx] = g_cmd
+
+
+        mujoco.mj_step(self.model, self.data)
+        self._t += 1
+        last = (self._t >= self._T)
+
+        img_primary, img_wrist = self._render_images()
+
+        return TimeStep(
+            dm_env.StepType.LAST if last else dm_env.StepType.MID,
+            reward=np.float32(0.0),
+            discount=np.float32(1.0),
+            observation={
+                "state": self.data.qpos.astype(np.float32).copy(),
+                "language_instruction": self.lang,
+                "image_primary": img_primary,     # <— NEW
+                "image_wrist": img_wrist,         # <— NEW
+            },
+        )
+
+
+    def _render_images(self):
+        # Render third-person
+        self._r_primary.update_scene(self.data, camera=self.cam_primary)
+        img_primary = self._r_primary.render().copy()  # RGB uint8
+        # Render wrist
+        self._r_wrist.update_scene(self.data, camera=self.cam_wrist)
+        img_wrist = self._r_wrist.render().copy()      # RGB uint8
+        return img_primary, img_wrist
+
+    def set_waypoints(self, waypoints: np.ndarray):
+        """Set waypoints without resetting the logger wrapper."""
+        self._waypoints = waypoints.astype(np.float32)
+        self._T = len(waypoints)
+        self._t = 0
+
+
+    def observation_spec(self):
+        return {
+            "state": specs.Array(shape=(self.model.nq,), dtype=np.float32, name="state"),
+            "language_instruction": specs.Array(shape=(), dtype=object, name="language_instruction"),
+            "image_primary": specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="image_primary"),
+            "image_wrist":   specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="image_wrist"),
+        }
+
+    def action_spec(self):
+        # We’ll log what we *apply*: 7 torques (or targets) + 1 gripper cmd
+        return specs.Array(shape=(7,), dtype=np.float32, name="action")
 
 # --------------------------- Model introspection ------------------------------
 
@@ -135,6 +265,21 @@ def ee_world_pose(model, data, ee_ref):
         pos = data.xpos[bid].copy()
         rot = data.xmat[bid].reshape(3,3).copy()
     return pos, rot
+
+def eef_poses_for_waypoints(model, data, ee_ref, waypoints_q, arm_qpos_addr):
+    """Returns lists of (pos, rot) for each q in waypoints_q without altering sim."""
+    q_backup = data.qpos.copy()
+    poses = []
+    try:
+        for q in waypoints_q:
+            data.qpos[arm_qpos_addr] = q
+            mujoco.mj_forward(model, data)
+            p, R = ee_world_pose(model, data, ee_ref)
+            poses.append((p.copy(), R.copy()))
+    finally:
+        data.qpos[:] = q_backup
+        mujoco.mj_forward(model, data)
+    return poses
 
 
 # ------------------------------- Jacobian IK ----------------------------------
@@ -258,166 +403,193 @@ def get_arm_qvel(data, arm_dof_idx):
     """Return the 7 arm joint velocities (indexed by DOF)."""
     return data.qvel[arm_dof_idx].copy()
 
-def oracle_step(model, data, waypoints, arm_act_ids, arm_qpos_addr, arm_dof_idx, gripper_idx, step):
+# def oracle_step(model, data, waypoints, arm_act_ids, arm_qpos_addr, arm_dof_idx, gripper_idx, step):
+#     """
+#     Torque-mode oracle: PD on 7 joints + gripper command from waypoints[:,7].
+#     """
+#     idx = min(step, len(waypoints) - 1)
+#     q_target = waypoints[idx, :7]
+#     g_cmd    = waypoints[idx, 7]
+
+#     q_cur  = data.qpos[arm_qpos_addr]
+#     qd_cur = data.qvel[arm_dof_idx]
+
+#     Kp, Kd = 300.0, 10.0  # tune as you like
+#     tau = Kp * (q_target - q_cur) - Kd * qd_cur
+#     data.ctrl[arm_act_ids] = tau
+
+#     if 0 <= gripper_idx < model.nu:
+#         data.ctrl[gripper_idx] = g_cmd
+
+def run_oracle_policy(env, base_env, model, data, arm_dof_idx, arm_qpos_addr, ee_ref):
+    """Plan A→B, build waypoints (7 joints + gripper), and roll one logged episode with Octo-style actions."""
+    q_start = data.qpos[arm_qpos_addr].copy()
+
+    # --- choose planner
+    if PLANNER == "rrtstar":
+        traj_q = plan_AB_rrtstar_joint_traj(
+            model, data, q_start, GOAL_POS, GOAL_QUAT_WXYZ,
+            arm_dof_idx, arm_qpos_addr, ee_ref, n_cart=None
+        )
+    else:
+        traj_q = plan_AB_cartesian_to_joint_traj(
+            model, data, q_start, GOAL_POS, GOAL_QUAT_WXYZ,
+            arm_dof_idx, arm_qpos_addr, ee_ref, n_cart=N_CART_WAYPOINTS
+        )
+
+    # ---- hold + gripper schedule (unchanged)
+    EXTRA_HOLD = 150
+    traj_q_hold = np.concatenate(
+        [traj_q, np.repeat(traj_q[-1][None, :], EXTRA_HOLD, axis=0)],
+        axis=0
+    )
+    N = len(traj_q)
+    PRE_OPEN_STEPS = 30
+    GRIP_OPEN, GRIP_CLOSE = 1.0, 0.0
+
+    grip = np.empty(len(traj_q_hold), dtype=np.float32)
+    grip[: max(0, N - PRE_OPEN_STEPS)] = GRIP_CLOSE
+    grip[max(0, N - PRE_OPEN_STEPS): N] = GRIP_OPEN
+    grip[N:] = GRIP_CLOSE
+
+    waypoints = np.concatenate([traj_q_hold, grip[:, None]], axis=1).astype(np.float32)
+
+    # ---- precompute EEF poses for all joint waypoints
+    q_seq = waypoints[:, :7]
+    poses = eef_poses_for_waypoints(model, data, ee_ref, q_seq, arm_qpos_addr)  # [(p,R), ...]
+
+    p_cur0, R_cur0 = ee_world_pose(model, data, ee_ref)
+    eef_deltas = []
+    p0, R0 = poses[0]
+    dpos0 = (p0 - p_cur0)
+    dori0 = rotation_error_axis_angle(R_cur0, R0)
+    eef_deltas.append(np.concatenate([dpos0, dori0]))
+
+    for i in range(1, len(poses)):
+        p_prev, R_prev = poses[i-1]
+        p_i, R_i = poses[i]
+        dpos = (p_i - p_prev)
+        dori = rotation_error_axis_angle(R_prev, R_i)
+        eef_deltas.append(np.concatenate([dpos, dori]))
+    eef_deltas = np.asarray(eef_deltas, dtype=np.float32)
+
+    # ---- set waypoints, reset env, roll out
+    base_env.set_waypoints(waypoints)
+    ts = env.reset()
+
+    g_cmd0 = np.float32(1.0 if waypoints[0, 7] > 0.5 else 0.0)
+    first_action = np.concatenate([eef_deltas[0], [g_cmd0]]).astype(np.float32)
+    ts = env.step(first_action)
+
+    t = 1
+    max_steps = len(waypoints) + 2
+    while t < max_steps:
+        idx = min(t, len(waypoints) - 1)
+        q_target = waypoints[idx, :7]
+        g_cmd    = waypoints[idx, 7]
+        q_cur  = data.qpos[arm_qpos_addr]
+        qd_cur = data.qvel[arm_dof_idx]
+        tau = 300.0*(q_target - q_cur) - 10.0*qd_cur
+        data.ctrl[base_env.arm_act_ids] = tau
+        if 0 <= base_env.gripper_idx < model.nu:
+            data.ctrl[base_env.gripper_idx] = g_cmd
+        mujoco.mj_step(model, data)
+
+        g_val = np.float32(1.0 if g_cmd > 0.5 else 0.0)
+        a = np.concatenate([eef_deltas[idx], [g_val]]).astype(np.float32)
+        ts = env.step(action=a)
+
+        t += 1
+        if ts.last():
+            break
+
+# ------------------------------ RRT pathplanning ------------------------------
+
+
+# New: collision-aware RRT* planner with identical call shape.
+def plan_AB_rrtstar_joint_traj(model, data, q_start, goal_pos, goal_quat_wxyz,
+                               arm_dof_idx, arm_qpos_addr, ee_ref,
+                               n_cart=None, *, rrt_cfg: RRTStarConfig | None = None, allow_contact=None):
     """
-    Torque-mode oracle: PD on 7 joints + gripper command from waypoints[:,7].
+    Plan a collision-free joint trajectory to (goal_pos, goal_quat_wxyz) using RRT*.
+    The q_start/n_cart args are accepted for signature compatibility with the IK planner.
     """
-    idx = min(step, len(waypoints) - 1)
-    q_target = waypoints[idx, :7]
-    g_cmd    = waypoints[idx, 7]
+    return plan_joint_traj_to_tomato(
+        model, data,
+        arm_dof_idx=arm_dof_idx,
+        arm_qpos_addr=arm_qpos_addr,
+        ee_ref=ee_ref,
+        tomato_pos_world=goal_pos,
+        tomato_quat_wxyz=goal_quat_wxyz,
+        allow_contact=allow_contact,
+        rrt_cfg=rrt_cfg,
+    )
 
-    q_cur  = data.qpos[arm_qpos_addr]
-    qd_cur = data.qvel[arm_dof_idx]
-
-    Kp, Kd = 300.0, 10.0  # tune as you like
-    tau = Kp * (q_target - q_cur) - Kd * qd_cur
-    data.ctrl[arm_act_ids] = tau
-
-    if 0 <= gripper_idx < model.nu:
-        data.ctrl[gripper_idx] = g_cmd
 
 
 
 # ----------------------------------- Main -------------------------------------
 
 def main():
-    # Load model/data
     model = mujoco.MjModel.from_xml_path(MODEL_PATH)
     data = mujoco.MjData(model)
 
-    # --- enumerate bodies/sites (trim or filter as you like) ---
-    max_list = min(100, model.nbody)  # raise if you want everything
-    bodies = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(max_list)]
-    sites  = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i) for i in range(model.nsite)]
-    print("[BODIES] first", max_list, ":", bodies)
-    print("[SITES] all   :", sites)
-
-    # Gripper & arm mapping
     gripper_idx = find_gripper_actuator(model, DEFAULT_GRIPPER_IDX)
     arm_act_ids, arm_qpos_addr = build_arm_mapping_from_model(model, gripper_idx)
     arm_dof_idx = build_arm_dof_indices(model, arm_act_ids)
 
-    print("model.nu =", model.nu)
-    print("Gripper actuator index:", gripper_idx,
-          "name:", mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, gripper_idx))
-    print("[MAP] ARM_ACT_IDS :", arm_act_ids)
-    print("[MAP] ARM_QPOS_ADDR:", arm_qpos_addr)
-    print("[MAP] ARM_DOF_IDX:", arm_dof_idx)
-
-    # Check actuator types (0=general, 2=velocity, 3=position in recent MuJoCo; torque is 'general' with dyn params)
-    print("[ACT TYPES]", [int(model.actuator_gaintype[aid]) for aid in arm_act_ids])
-
-
-    # Quick sanity: teleporting should move the chosen EE
-    mujoco.mj_forward(model, data)
-    if EE_REF[0] == "site":
-        sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, EE_REF[1])
-        p0 = data.site_xpos[sid].copy()
-    else:
-        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_REF[1])
-        p0 = data.xpos[bid].copy()
-    _bak = data.qpos.copy()
-    bump = data.qpos.copy()
-    bump[arm_qpos_addr[0]] += 0.3
-    data.qpos[:] = bump; mujoco.mj_forward(model, data)
-    if EE_REF[0] == "site":
-        p1 = data.site_xpos[sid].copy()
-    else:
-        p1 = data.xpos[bid].copy()
-    data.qpos[:] = _bak; mujoco.mj_forward(model, data)
-    print(f"[SANITY] EE moved by {np.linalg.norm(p1 - p0):.4f} m (should be > 0.02)")
-
-    # Reset to a known start
-    data.qpos[arm_qpos_addr] = START_JOINTS
-    mujoco.mj_forward(model, data)
-
-    # Plan A→B with Jacobian IK (blog-style)
-    q_start = data.qpos[arm_qpos_addr].copy()
-    traj_q = plan_AB_cartesian_to_joint_traj(
-        model, data, q_start, GOAL_POS, GOAL_QUAT_WXYZ,
-        arm_dof_idx, arm_qpos_addr, EE_REF, n_cart=N_CART_WAYPOINTS
+    # Define RLDS/TFDS spec
+    dataset_config = tfds.rlds.rlds_base.DatasetConfig(
+        name="tomato_rlds",
+        observation_info=tfds.features.FeaturesDict({
+            "state": tfds.features.Tensor(shape=(model.nq,), dtype=np.float32),
+            "language_instruction": tfds.features.Text(),
+            "image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
+            "image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
+        }),
+        action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),  # 6-DoF ΔEEF + gripper
+        reward_info=tf.float32,
+        discount_info=tf.float32,
     )
 
-    # Debug: does last q reach the goal?
-    _bak = data.qpos.copy()
-    data.qpos[arm_qpos_addr] = traj_q[-1]; mujoco.mj_forward(model, data)
-    ee_pos, _ = ee_world_pose(model, data, EE_REF)
-    err = np.linalg.norm(ee_pos - GOAL_POS)
-    data.qpos[:] = _bak; mujoco.mj_forward(model, data)
-    print(f"[DEBUG] EE final world pos: {ee_pos}, goal: {GOAL_POS}, |err|={err:.4f} m")
 
-    # Build waypoints (+ gripper)
-    g_cmd = 0.6 if True else 0.0  # open gripper; flip if needed
-   
-   
-   # --- make the arm hold the final pose for settling ---
-    EXTRA_HOLD = 150
-    traj_q_hold = np.concatenate(
-        [traj_q, np.repeat(traj_q[-1][None, :], EXTRA_HOLD, axis=0)],
-        axis=0
+    TFDS_OUT_DIR = "/home/myrtheiw/tfds_out"
+    os.makedirs(TFDS_OUT_DIR, exist_ok=True)
+
+    # Wrap env with logger (TFDS backend)
+    base_env = PandaOracleEnv(
+        model, data, arm_act_ids, arm_qpos_addr, arm_dof_idx,
+        EE_REF, language_instruction="Pick the tomato...", kp=300.0, kd=10.0,
+        torque_mode=True, gripper_idx=gripper_idx,               # <— pass it in
     )
 
-    # --- gripper schedule ---
-    # semantics:
-    #   - CLOSED during approach
-    #   - OPEN for the last PRE_OPEN_STEPS before the goal (to get around the object)
-    #   - CLOSE exactly at the goal and keep closed during the hold
-    GRIP_OPEN  = 0.6
-    GRIP_CLOSE = 0.0
-    PRE_OPEN_STEPS = 30  # tweak: how many steps before the goal to open
+    env = envlogger.EnvLogger(
+        base_env,
+        backend=tfds_backend_writer.TFDSBackendWriter(
+            data_directory=TFDS_OUT_DIR,
+            split_name="train",
+            max_episodes_per_file=1,   # <- was 500
+            ds_config=dataset_config,
+        ),
+    )
 
-    N = len(traj_q)  # index of the first "at goal" step is N-1
-    grip = np.empty(len(traj_q_hold), dtype=float)
-    # approach: closed
-    grip[: max(0, N - PRE_OPEN_STEPS)] = GRIP_CLOSE
-    # pre-open window: open
-    grip[max(0, N - PRE_OPEN_STEPS): N] = GRIP_OPEN
-    # at-goal and during hold: close
-    grip[N:] = GRIP_CLOSE
+    try:
+        run_oracle_policy(env, base_env, model, data, arm_dof_idx, arm_qpos_addr, EE_REF)
+    finally:
+        env.close()  # single point of close
 
-    # pack waypoints: 7 joints + 1 gripper per row
-    waypoints = np.concatenate([traj_q_hold, grip[:, None]], axis=1)
+    print(f"✅ RLDS/TFDS episode written under {TFDS_OUT_DIR}")
 
-    # episode length matches waypoints
-    EP_LENGTH = len(waypoints)
+    # -------------- Verify by loading with TFDS ------------------
+    ds = tfds.builder_from_directory(TFDS_OUT_DIR).as_dataset(split="train")
+    for ep in ds.take(1):
+        steps = ep["steps"]
+        for s in steps.take(3):
+            print("state:", s["observation"]["state"].shape,
+                  "action:", s["action"].shape,
+                  "first/last:", s["is_first"].numpy(), s["is_last"].numpy())
 
 
-    # Record one episode
-    episodes = []
-    current_episode = []
-    language_command = "Pick the tomato from the top truss closest to you."
-    for step in range(EP_LENGTH):
-        oracle_step(model, data, waypoints, arm_act_ids, arm_qpos_addr, arm_dof_idx, gripper_idx, step)
-        action_snapshot = data.ctrl.copy()
-        mujoco.mj_step(model, data)
-
-        obs = {
-            "state": data.qpos.copy(),
-            "action": action_snapshot,
-            "reward": 0,
-            "is_terminal": step == (EP_LENGTH - 1),
-            "is_first": step == 0,
-            "language_command": language_command,
-        }
-        current_episode.append(obs)
-    episodes.append(current_episode)
-
-    # Save TFRecord
-    os.makedirs(os.path.dirname(REC_PATH), exist_ok=True)
-    with tf.io.TFRecordWriter(REC_PATH) as writer:
-        for episode in episodes:
-            for obs in episode:
-                feature = {
-                    "state": tf.train.Feature(float_list=tf.train.FloatList(value=obs["state"])),
-                    "action": tf.train.Feature(float_list=tf.train.FloatList(value=obs["action"])),
-                    "reward": tf.train.Feature(int64_list=tf.train.Int64List(value=[obs["reward"]])),
-                    "is_terminal": tf.train.Feature(int64_list=tf.train.Int64List(value=[int(obs["is_terminal"])])),
-                    "is_first": tf.train.Feature(int64_list=tf.train.Int64List(value=[int(obs["is_first"])])),
-                    "language_command": tf.train.Feature(bytes_list=tf.train.BytesList(value=[obs["language_command"].encode()])),
-                }
-                example = tf.train.Example(features=tf.train.Features(feature=feature))
-                writer.write(example.SerializeToString())
-    print(f"✅ Dataset saved with {len(episodes)} episode(s) to {REC_PATH}")
 
 
 if __name__ == "__main__":
