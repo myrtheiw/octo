@@ -54,6 +54,7 @@ from helpers import (
     find_side_stem_targets as _find_top_targets,        # compute grasp + approach
     place_frame_mocap as _place_frame_mocap,            # viz helper (optional)
     scene_dir_from_model_path as _scene_dir,
+    _choose_split_for_plant as choose_split_for_plant,  # new helper for train/val/test splits
 )
 
 # ------------------------------- Config ---------------------------------------
@@ -73,8 +74,10 @@ IMG_H, IMG_W     = 256, 256
 
 # Motion staging & pacing
 START_JOINTS        = np.array([0.0, -0.5, 0.0, -1.5, 0.0, 1.5, 0.0], dtype=float)
-PREGRASP_OFFSET     = 0.06     # meters along lateral normal (bigger is safer near foliage)
+PREGRASP_OFFSET     = 0.1   # meters along lateral normal (bigger is safer near foliage)
 RETREAT_OFFSET      = 0.0     # meters opposite lateral normal (back out)
+PREGRASP_DWELL_SEC = 1.0  # hold at pregrasp so the gripper can fully open
+
 N_CART_WAYPOINTS    = 60       # resampled joint waypoints total (smoothness vs length)
 WAYPOINT_REPEAT     = 2        # repeat each waypoint to slow motion (stability)
 PAUSE_PREGRASP_STEPS= 40       # dwell at pregrasp while open
@@ -92,6 +95,10 @@ AVOID_LINKS = ("link3", "link4", "link5", "link6", "hand")
 AVOID_D0    = 0.10
 AVOID_GAIN  = 0.6
 AVOID_LAM   = 0.05
+
+HAND_ROLL_AT_GRASP_DEG = 30.0   # how much to roll the last joint before closing
+ROLL_RAMP_STEPS        = 20     # how many trajectory steps to spread that roll over
+
 
 # PD controller gains (simple diagonal)
 PD_KP = 100.0
@@ -120,13 +127,13 @@ DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.1")
 
 # Debug
 DEBUG_IK        = True
-LIVE_RENDER     = True
+LIVE_RENDER     = False
 LIVE_FPS        = 60.0
 SHOW_DEBUG_VIZ  = False   # set True to drop mocap frames (pre/goal/retreat)
 
 # --- Quality gate: only log successful episodes ---
 MAX_FINAL_ERR = 0.010      # meters; tighten/loosen for your dataset quality
-LIVE_RENDER_QC = True      # render the QC dry-run, like LIVE_RENDER
+LIVE_RENDER_QC = False      # render the QC dry-run, like LIVE_RENDER
 CAPTURE_IMAGES_DURING_QC = False  # speed up QC (don’t waste time rendering)
 
 
@@ -437,7 +444,8 @@ def plan_cartesian_to_joint_traj(
 
     # Lateral approach normal from plant center to goal (in xy plane)
     n_app = _approach_normal_lateral(model, data, goal_pos)  # unit vector in xy
-
+    orth_u = np.array([-n_app[1], n_app[0], 0.0], dtype=float); 
+    orth_u /= (np.linalg.norm(orth_u) + 1e-9)
     pre_pos = goal_pos + float(pregrasp_offset) * n_app if pregrasp_offset > 0 else goal_pos
     ret_pos = goal_pos - float(retreat_offset)  * n_app if retreat_offset  > 0 else goal_pos
 
@@ -536,7 +544,6 @@ class PandaOracleEnv(dm_env.Environment):
 
     def _render_images(self):
         if not getattr(self, "_capture_images", True):
-            # return valid blank frames to satisfy the observation spec
             z = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
             return z, z
         self._r_primary.update_scene(self.data, camera=self.cam_primary)
@@ -668,6 +675,7 @@ def run_oracle_once(
 
     # ---- Plan & build waypoints if not supplied
     if waypoints is None:
+        # --- plan cartesian → joint waypoints
         traj_q, phase_idx = plan_cartesian_to_joint_traj(
             model, data, q_start, goal_pos,
             arm_dof_idx, arm_qpos_addr, ee_ref,
@@ -676,73 +684,121 @@ def run_oracle_once(
             obstacles=obstacles,
             goal_body_name=goal_body_name,
         )
-
-        # Phase indices in traj_q (pre, goal, retreat) — already computed by your planner
         end_pre, end_goal, end_ret = phase_idx
+        rep = int(WAYPOINT_REPEAT)
 
-        # Repeat each waypoint to slow down motion globally
-        traj_q_rep = np.repeat(traj_q, repeats=WAYPOINT_REPEAT, axis=0)
+        # repeat for slower motion
+        traj_q_rep = np.repeat(traj_q, repeats=rep, axis=0)
 
-        # Dwell at pregrasp (keep gripper open)
-        dwell_pre = np.repeat(traj_q_rep[end_pre:end_pre+1], repeats=PAUSE_PREGRASP_STEPS, axis=0)
+        # pregrasp dwell (open) — make it ~1 second of sim time
+        sim_dt = float(model.opt.timestep) * float(getattr(base_env, "substeps", 40))
+        dwell_pre_steps = int(np.ceil(float(globals().get("PREGRASP_DWELL_SEC", 1.0)) / max(sim_dt, 1e-9)))
+        dwell_pre = np.repeat(
+            traj_q_rep[end_pre*rep + (rep-1) : end_pre*rep + rep],
+            repeats=dwell_pre_steps, axis=0
+        )
+        print(f"[DWELL] pregrasp: {dwell_pre_steps} steps ≈ {dwell_pre_steps*sim_dt:.2f}s")
 
-        # >>> NEW: add a *goal* settle window before any closing <<<
-        goal_frame = traj_q_rep[end_goal:end_goal+1]
+        # goal settle (to let PD stop “ringing”)
+        GOAL_SETTLE_STEPS   = 60
+        goal_frame = traj_q_rep[end_goal*rep + (rep-1) : end_goal*rep + rep]
         dwell_goal = np.repeat(goal_frame, repeats=GOAL_SETTLE_STEPS, axis=0)
 
-        # Stitch sequence: [pre .. pre_end] + dwell_pre + [pre_end+1 .. goal] + dwell_goal + [goal+1 .. end]
+        # stitch joints (no retreat): [..pre] + dwell_pre + (pre→goal] + dwell_goal + (goal→end]
         traj_q_full = np.concatenate(
             [
-                traj_q_rep[:end_pre+1],
+                traj_q_rep[: (end_pre+1)*rep],
                 dwell_pre,
-                traj_q_rep[end_pre+1:end_goal+1],
+                traj_q_rep[(end_pre+1)*rep : (end_goal+1)*rep],
                 dwell_goal,
-                traj_q_rep[end_goal+1:],
+                traj_q_rep[(end_goal+1)*rep :],
             ],
             axis=0
         )
 
-        # Final post-trajectory hold (for logging stability)
+        # ---------- MICRO-CENTERING SHIM (measures lateral bias during goal dwell) ----------
+        idx_pre_end          = (end_pre+1)*rep
+        idx_goal_start       = idx_pre_end + dwell_pre_steps
+
+        idx_goal_end         = idx_goal_start + (end_goal - end_pre)*rep
+        idx_dwell_goal_start = idx_goal_end
+        idx_dwell_goal_end   = idx_goal_end + GOAL_SETTLE_STEPS
+
+        n_app  = _approach_normal_lateral(model, data, goal_pos)
+        orth_u = np.array([-n_app[1], n_app[0], 0.0], float)
+        orth_u /= (np.linalg.norm(orth_u) + 1e-9)
+
+        _bak = data.qpos.copy()
+        ees = []
+        for q in traj_q_full[idx_dwell_goal_start:idx_dwell_goal_end]:
+            data.qpos[arm_qpos_addr] = q; mujoco.mj_forward(model, data)
+            p, _ = _ee_pose(model, data, ee_ref); ees.append(p.copy())
+        data.qpos[:] = _bak; mujoco.mj_forward(model, data)
+
+        d_orth = float(np.mean([np.dot(p - goal_pos, orth_u) for p in ees])) if ees else 0.0
+        if abs(d_orth) > 0.003:
+            gpos_corr = goal_pos - d_orth * orth_u
+            q_corr = solve_ik_LM_position(
+                model, data, target_pos_world=gpos_corr,
+                arm_dof_idx=arm_dof_idx, arm_qpos_addr=arm_qpos_addr, ee_ref=ee_ref,
+                max_iters=80, pos_tol=5e-4, step_size=LM_STEP, damping=LM_DAMP,
+                debug=False, use_avoidance=True, obstacles=obstacles,
+                goal_ctx={"goal_pos": gpos_corr, "approach_dir": n_app}
+            )
+            last_goal_q = traj_q_full[idx_dwell_goal_end - 1]
+            micro = [last_goal_q + t*(q_corr - last_goal_q) for t in np.linspace(0.0, 1.0, 10, dtype=np.float32)]
+            traj_q_full = np.concatenate(
+                [traj_q_full[:idx_dwell_goal_end], np.asarray(micro, np.float32), traj_q_full[idx_dwell_goal_end:]],
+                axis=0
+            )
+            idx_dwell_goal_end += len(micro)
+        # ---------- END SHIM ----------
+        # ---- Roll the wrist (last joint) during the goal dwell, before closing ----
+        j_roll = 6  # last of the 7 arm joints in traj_q_* arrays
+
+        # We’ll apply the roll over the *end* of the goal-dwell window so it finishes before closing.
+        i1 = int(idx_dwell_goal_end)                                 # end of dwell
+        i0 = int(max(idx_dwell_goal_start, i1 - ROLL_RAMP_STEPS))    # start of ramp inside dwell
+        if i1 > i0:
+            roll0 = float(traj_q_full[i0 - 1, j_roll] if i0 > 0 else traj_q_full[0, j_roll])
+            roll1 = roll0 + np.deg2rad(float(HAND_ROLL_AT_GRASP_DEG))
+            for t, i in enumerate(range(i0, i1)):
+                a = (t + 1) / max(1, (i1 - i0))
+                traj_q_full[i, j_roll] = (1.0 - a) * roll0 + a * roll1
+            print(f"[WRIST] roll ramp: {HAND_ROLL_AT_GRASP_DEG:.1f}° over {i1 - i0} steps")
+        else:
+            print("[WRIST] (skipped) dwell too short for roll ramp")
+
+        # add final hold AFTER any splicing so lengths match
         traj_q_hold = np.concatenate(
             [traj_q_full, np.repeat(traj_q_full[-1][None, :], EXTRA_HOLD_STEPS, axis=0)],
             axis=0
         )
 
-        # --------- choose a *distance-based* close_start ----------
-        # Simulate FK along the built joint path to see where EE is truly within GRASP_START_DIST.
+        # distance-based grasp timing (robust)
         _bak = data.qpos.copy()
         dists = []
         for q in traj_q_full:
-            data.qpos[arm_qpos_addr] = q
-            mujoco.mj_forward(model, data)
+            data.qpos[arm_qpos_addr] = q; mujoco.mj_forward(model, data)
             ee, _ = _ee_pose(model, data, ee_ref)
             dists.append(float(np.linalg.norm(goal_pos - ee)))
-        data.qpos[:] = _bak
-        mujoco.mj_forward(model, data)
+        data.qpos[:] = _bak; mujoco.mj_forward(model, data)
 
-        # first index where EE is inside the grasp radius
+        GRASP_START_DIST      = 0.006
+        MIN_CLOSE_IDX_MARGIN  = 4
         idx_close = next((i for i, d in enumerate(dists) if d <= GRASP_START_DIST), len(dists) - 1)
-
-        # also make sure we *don’t* start before the explicit goal frame and its settle window
-        idx_goal_arrival = end_pre + 1 + PAUSE_PREGRASP_STEPS + (end_goal - end_pre)  # rough lower bound
-        idx_goal_arrival *= WAYPOINT_REPEAT
-        idx_goal_arrival += GOAL_SETTLE_STEPS
-        close_start = max(idx_close, idx_goal_arrival + MIN_CLOSE_IDX_MARGIN)
+        close_start = max(idx_dwell_goal_end + MIN_CLOSE_IDX_MARGIN, idx_close)
         close_start = min(close_start, len(traj_q_full) - 1)
 
-        # Build gripper schedule: open → close from close_start onward
-        N = len(traj_q_full) + EXTRA_HOLD_STEPS
+        # gripper ramp (reduces finger chatter)
+        N = len(traj_q_hold)
         GRIP_OPEN, GRIP_CLOSE = 1.0, 0.0
-        GRIPPER_RAMP_STEPS = 25  # ~0.4 s if your outer loop is ~60 Hz
-        grip = np.full(N, GRIP_OPEN, dtype=np.float32)
-
+        GRIPPER_RAMP_STEPS    = 25
+        grip = np.full(N, GRIP_OPEN, np.float32)
         end_ramp = min(close_start + GRIPPER_RAMP_STEPS, N)
-        ramp = np.linspace(GRIP_OPEN, GRIP_CLOSE, end_ramp - close_start, dtype=np.float32)
-        grip[close_start:end_ramp] = ramp
+        grip[close_start:end_ramp] = np.linspace(GRIP_OPEN, GRIP_CLOSE, end_ramp - close_start, dtype=np.float32)
         grip[end_ramp:] = GRIP_CLOSE
 
-
-        # Stitch the final (T, 8) waypoint array
         waypoints = np.concatenate([traj_q_hold, grip[:, None]], axis=1).astype(np.float32)
 
     # ---- DRY RUN: execute without logging (optional QC)
@@ -837,6 +893,9 @@ def main():
         # Fresh plant + scene
         if USE_DYNAMIC_PLANT:
             model, data = _build_and_load_scene(MODEL_PATH)
+            split_name = choose_split_for_plant(plant_idx)
+            print(f"[SPLIT] Plant {plant_idx} → {split_name}")
+
         else:
             model = mujoco.MjModel.from_xml_path(MODEL_PATH)
             data  = mujoco.MjData(model)
@@ -910,7 +969,7 @@ def main():
 
                     # --- robust lateral side selection (keeps approach away from plant center) ---
                     STEM_R = 0.0025
-                    CLEAR  = 0.0015
+                    CLEAR  = 0.0000
                     offset_mag = STEM_R + CLEAR
 
                     c_plant, _ = _body_pos(model, data, "tomato_plant")
@@ -922,7 +981,8 @@ def main():
 
                     # Exclude the active stem & its truss from avoidance if you do that elsewhere
                     obstacles = [b for b in obstacles_all if b not in (stem_name, truss_name)]
-
+                    
+                    base_env.lang = f"Pick tomato truss at {stem_name} (plant={plant_idx}, split={split_name})"
                     # --- QC dry-run (no logging) ---
                     err_final, waypoints = run_oracle_once(
                         env=None, base_env=base_env, model=model, data=data,
@@ -939,11 +999,12 @@ def main():
                     print("[QC] ✅ Keep episode")
 
                     # --- Log the successful episode with the *same* waypoints ---
+                    # --- after QC passes ---
                     with envlogger.EnvLogger(
                         base_env,
                         backend=tfds_backend_writer.TFDSBackendWriter(
                             data_directory=TFDS_ROOT_DIR,
-                            split_name="train",  # or your split selector
+                            split_name=split_name,                # ← use plant-based split
                             max_episodes_per_file=2,
                             ds_config=tfds.rlds.rlds_base.DatasetConfig(
                                 version=tfds.core.Version(DATASET_VERSION),
@@ -963,11 +1024,11 @@ def main():
                         run_oracle_once(
                             env, base_env, model, data, arm_dof_idx, arm_qpos_addr, ee_ref,
                             goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
-                            waypoints=waypoints, dry_run=False,  # <— re-use validated waypoints
+                            waypoints=waypoints, dry_run=False,
                         )
                         episodes_done += 1
-
                         print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
+
 
 
             except Exception as e:
