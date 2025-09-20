@@ -28,6 +28,7 @@ import numpy as np
 import mujoco
 import dm_env
 from dm_env import specs, TimeStep
+import json, re, glob, os
 
 # Rendering
 from mujoco import viewer
@@ -39,10 +40,10 @@ import envlogger
 from envlogger.backends import tfds_backend_writer
 
 # Target detection utils (you already have these)
-from getlocation import get_side_stem_origins_and_quats, get_side_stem_grasp_points
+from record_dataset.getlocation import get_side_stem_origins_and_quats, get_side_stem_grasp_points
 
 # Collision avoidance + dynamic scene helpers (provided in your helpers.py)
-from helpers import (
+from record_dataset.helpers import (
     damped_pinv as _damped_pinv,
     body_pos as _body_pos,
     approx_body_radius_max as _approx_body_radius,
@@ -54,7 +55,10 @@ from helpers import (
     find_side_stem_targets as _find_top_targets,        # compute grasp + approach
     place_frame_mocap as _place_frame_mocap,            # viz helper (optional)
     scene_dir_from_model_path as _scene_dir,
-    _choose_split_for_plant as choose_split_for_plant,  # new helper for train/val/test splits
+    _choose_split_for_plant as choose_split_for_plant,
+    _repair_tfds_splits_at_dir as repair_tfds_splits,
+    _expected_ds_dir as expected_ds_dir,
+    _move_stray_shards_into_version_dir as move_stray_shards_into_version_dir,
 )
 
 # ------------------------------- Config ---------------------------------------
@@ -123,7 +127,7 @@ EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.1")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.6")
 
 # Debug
 DEBUG_IK        = True
@@ -137,7 +141,85 @@ LIVE_RENDER_QC = False      # render the QC dry-run, like LIVE_RENDER
 CAPTURE_IMAGES_DURING_QC = False  # speed up QC (don’t waste time rendering)
 
 
+# Train/val/test ratios (edit as you like)
+SPLIT_RATIOS = dict(train=0.90, val=0.10, test=0.0)
+
+
+
 # --------------------------- Model/Actuator mapping ---------------------------
+def _post_write_repair(dataset_dir: str, dataset_name: str):
+    """Make shard names TFDS-friendly and (re)write dataset_info.json splits."""
+    import os as _os, glob as _glob, json as _json, tensorflow as _tf
+
+    _os.makedirs(dataset_dir, exist_ok=True)
+
+    # 1) Force the '-of-' suffix for any single-shard files envlogger makes.
+    for p in list(_glob.glob(_os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-*"))):
+        b = _os.path.basename(p)
+        # e.g. tomato_rlds-train.tfrecord-00000  ->  tomato_rlds-train.tfrecord-00000-of-00001
+        if b.endswith(".tfrecord-00000") and "-of-" not in b:
+            nb = b.replace(".tfrecord-00000", ".tfrecord-00000-of-00001")
+            _os.rename(p, _os.path.join(dataset_dir, nb))
+
+    # 2) Gather shards for each split (support both suffixed and legacy names).
+    split_to_files = {}
+    patterns = [
+        _os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-*-of-*"),
+        _os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-0000*"),  # fallback if rename failed
+    ]
+    seen = set()
+    for pat in patterns:
+        for p in sorted(_glob.glob(pat)):
+            if p in seen:
+                continue
+            seen.add(p)
+            base = _os.path.basename(p)
+            # tomato_rlds-<split>.tfrecord-...
+            try:
+                split = base.split("-")[1].split(".")[0]
+            except Exception:
+                continue
+            split_to_files.setdefault(split, []).append(p)
+
+    def _count_records(path):
+        n = 0
+        for _ in _tf.data.TFRecordDataset(path):
+            n += 1
+        return max(1, n)  # be conservative; TFDS tolerates this
+
+    # 3) Build split entries (only for splits that have at least one shard file).
+    splits_info = []
+    for sp, files in sorted(split_to_files.items()):
+        shard_lengths = [_count_records(f) for f in files]
+        num_bytes = sum(_os.path.getsize(f) for f in files)
+        splits_info.append({
+            "name": sp,
+            "shardLengths": shard_lengths,
+            "numBytes": num_bytes,
+        })
+
+    # 4) Write/patch dataset_info.json.
+    info_path = _os.path.join(dataset_dir, "dataset_info.json")
+    info = {}
+    if _os.path.exists(info_path):
+        try:
+            with open(info_path, "r") as f:
+                info = _json.load(f)
+        except Exception:
+            info = {}
+    info["name"] = dataset_name
+    info["version"] = _os.path.basename(dataset_dir)  # e.g. "0.0.4"
+    info["splits"] = splits_info
+    with open(info_path, "w") as f:
+        _json.dump(info, f, indent=2)
+
+
+def choose_split_for_episode(ep_idx: int) -> str:
+    # always put the very first one in train
+    if ep_idx == 0:
+        return "train"
+    return "val" if ((ep_idx + 1) % 10 == 0) else "train"
+
 
 def find_gripper_actuator(model):
     for aid in range(model.nu):
@@ -519,7 +601,9 @@ class PandaOracleEnv(dm_env.Environment):
     """dm_env around MuJoCo Panda using joint waypoints + **PD torque control**."""
     def __init__(self, model, data, arm_act_ids, arm_qpos_addr, ee_ref,
                  language_instruction, substeps=40, gripper_idx=-1,
-                 arm_dof_idx=None, kp=PD_KP, kd=PD_KD):
+                 arm_dof_idx=None, kp=PD_KP, kd=PD_KD,
+                 control_mode: str = "waypoints",
+                 action_scale: float = 0.05):
         self.model = model; self.data = data
         self.arm_act_ids = arm_act_ids
         self.arm_qpos_addr = arm_qpos_addr
@@ -531,6 +615,8 @@ class PandaOracleEnv(dm_env.Environment):
         self._capture_images = True
         self.kp = float(kp)
         self.kd = float(kd) if kd is not None else float(2.0 * np.sqrt(kp))
+        self.control_mode = str(control_mode)
+        self.action_scale = float(action_scale)
         self._waypoints = None; self._T = 0; self._t = 0
 
         # Renderers
@@ -558,24 +644,35 @@ class PandaOracleEnv(dm_env.Environment):
         self._T = len(waypoints)
         self._t = 0
 
+    # --- modify reset() to allow policy mode (no waypoints needed) ---
     def reset(self, waypoints=None):
-        if waypoints is not None:
+        if self.control_mode == "waypoints":
+            if waypoints is None:
+                raise ValueError("reset(...): waypoints required in waypoints mode")
             self.set_waypoints(waypoints)
+        else:
+            # policy mode: no waypoints
+            self._waypoints = None
+            self._T = 0
+            self._t = 0
+
         mujoco.mj_resetData(self.model, self.data)
         self.data.qvel[:] = 0.0
+        # start pose: waypoint[0] if present, else default START_JOINTS
         if self._waypoints is not None and self._T > 0:
             self.data.qpos[self.arm_qpos_addr] = self._waypoints[0, :7]
         else:
             self.data.qpos[self.arm_qpos_addr] = START_JOINTS
         mujoco.mj_forward(self.model, self.data)
         self._t = 0
+
         img_primary, img_wrist = self._render_images()
         return TimeStep(
             dm_env.StepType.FIRST,
             reward=np.float32(0.0),
             discount=np.float32(1.0),
             observation={
-                "state": self.data.qpos.astype(np.float32).copy(),
+                "proprio": self.data.qpos.astype(np.float32).copy(),
                 "language_instruction": self.lang,
                 "image_primary": img_primary,
                 "image_wrist": img_wrist,
@@ -592,20 +689,37 @@ class PandaOracleEnv(dm_env.Environment):
                     q_clamped[i] = np.clip(q_clamped[i], lo, hi)
         return q_clamped
 
+    # --- modify step() to consume policy actions when control_mode == "policy" ---
     def step(self, action):
-        if self._waypoints is None or self._T == 0:
-            raise RuntimeError("step() called before reset(waypoints=...)")
-        if self.arm_dof_idx is None:
-            raise RuntimeError("arm_dof_idx must be provided for PD control")
+        if self.control_mode == "waypoints":
+            if self._waypoints is None or self._T == 0:
+                raise RuntimeError("step() in waypoints mode before reset(waypoints=...)")
+            if self.arm_dof_idx is None:
+                raise RuntimeError("arm_dof_idx must be provided for PD control")
 
-        idx = min(self._t, self._T - 1)
-        q_target = self._waypoints[idx, :7]
-        g_cmd    = self._waypoints[idx,  7]
+            idx = min(self._t, self._T - 1)
+            q_target = self._waypoints[idx, :7]
+            g_cmd    = self._waypoints[idx,  7]
+        else:
+            # POLICY MODE: use incoming action
+            if self.arm_dof_idx is None:
+                raise RuntimeError("arm_dof_idx must be provided for PD control")
+            a = np.asarray(action)
+            # Octo often outputs (T, 7) over a future horizon; take first slice.
+            if a.ndim == 2 and a.shape[-1] == 7:
+                a = a[0]
+            a = a.reshape(-1)
+            if a.shape[0] != 7:
+                raise ValueError(f"Expected 7-DoF action, got shape {a.shape}")
 
-        # Respect joint limits for the target
-        q_target = self._clamp_to_limits(q_target)
+            q  = self.data.qpos[self.arm_qpos_addr].copy()
+            # interpret as joint deltas; tune scale as needed
+            q_target = q + self.action_scale * a
+            q_target = self._clamp_to_limits(q_target)
+            # If you want gripper control from policy, read extra channel here; else hold current
+            g_cmd = self.data.ctrl[self.gripper_idx] if (0 <= self.gripper_idx < self.model.nu) else 0.0
 
-        # PD torque control over several internal substeps
+        # Common PD inner loop
         for _ in range(self.substeps):
             q  = self.data.qpos[self.arm_qpos_addr].copy()
             qd = self.data.qvel[self.arm_dof_idx].copy()
@@ -617,14 +731,14 @@ class PandaOracleEnv(dm_env.Environment):
             mujoco.mj_step(self.model, self.data)
 
         self._t += 1
-        last = (self._t >= self._T)
+        last = False if self.control_mode == "policy" else (self._t >= self._T)
         img_primary, img_wrist = self._render_images()
         return TimeStep(
             dm_env.StepType.LAST if last else dm_env.StepType.MID,
             reward=np.float32(0.0),
             discount=np.float32(1.0),
             observation={
-                "state": self.data.qpos.astype(np.float32).copy(),
+                "proprio": self.data.qpos.astype(np.float32).copy(),
                 "language_instruction": self.lang,
                 "image_primary": img_primary,
                 "image_wrist": img_wrist,
@@ -640,7 +754,7 @@ class PandaOracleEnv(dm_env.Environment):
 
     def observation_spec(self):
         return {
-            "state": specs.Array(shape=(self.model.nq,), dtype=np.float32, name="state"),
+            "proprio": specs.Array(shape=(self.model.nq,), dtype=np.float32, name="proprio"),
             "language_instruction": specs.Array(shape=(), dtype=object, name="language_instruction"),
             "image_primary": specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="image_primary"),
             "image_wrist":   specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="image_wrist"),
@@ -890,155 +1004,123 @@ def main():
     plant_idx = 0
 
     while episodes_done < EPISODES_TOTAL:
-        # Fresh plant + scene
-        if USE_DYNAMIC_PLANT:
-            model, data = _build_and_load_scene(MODEL_PATH)
-            split_name = choose_split_for_plant(plant_idx)
-            print(f"[SPLIT] Plant {plant_idx} → {split_name}")
+        try:
+            # --------- Build / reset plant ---------
+            if USE_DYNAMIC_PLANT:
+                model, data = _build_and_load_scene(MODEL_PATH)
+                print(f"[SPLIT] (dynamic plant; split chosen per-episode)")
+            else:
+                model = mujoco.MjModel.from_xml_path(MODEL_PATH)
+                data  = mujoco.MjData(model)
+                mujoco.mj_forward(model, data)
 
-        else:
-            model = mujoco.MjModel.from_xml_path(MODEL_PATH)
-            data  = mujoco.MjData(model)
-            mujoco.mj_forward(model, data)
+            ee_ref = ("site", "tcp") if _site_exists(model, "tcp") else ("body", "hand")
+            print(f"[EE_REF] using {ee_ref[0].upper()} '{ee_ref[1]}'")
 
-        # Choose EE reference (prefer TCP site if present)
-        ee_ref = ("site", "tcp") if _site_exists(model, "tcp") else ("body", "hand")
-        print(f"[EE_REF] using {ee_ref[0].upper()} '{ee_ref[1]}'")
+            obstacles_all = _collect_plant_obstacles(model)
+            print(f"[AVOID] using {len(obstacles_all)} plant bodies as obstacles")
 
-        # Obstacles (recomputed each plant)
-        obstacles_all = _collect_plant_obstacles(model)
-        print(f"[AVOID] using {len(obstacles_all)} plant bodies as obstacles")
+            arm_act_ids, arm_qpos_addr = build_arm_mapping_from_model(model, prefer_position=True)
+            arm_dof_idx = build_arm_dof_indices(model, arm_act_ids)
 
-        # Arm mapping
-        arm_act_ids, arm_qpos_addr = build_arm_mapping_from_model(model, prefer_position=True)
-        arm_dof_idx = build_arm_dof_indices(model, arm_act_ids)
+            if AUTO_WIDEN_LIMITS:
+                for i, dof in enumerate(arm_dof_idx):
+                    jid = int(model.dof_jntid[dof])
+                    model.jnt_limited[jid] = 1
+                    lo, hi = TYPICAL_FRANKA_LIMITS[i]
+                    model.jnt_range[jid][0] = lo
+                    model.jnt_range[jid][1] = hi
 
-        # Optional: widen limits for the 7 arm joints
-        if AUTO_WIDEN_LIMITS:
-            for i, dof in enumerate(arm_dof_idx):
-                jid = int(model.dof_jntid[dof])
-                model.jnt_limited[jid] = 1
-                lo, hi = TYPICAL_FRANKA_LIMITS[i]
-                model.jnt_range[jid][0] = lo
-                model.jnt_range[jid][1] = hi
+            gripper_idx = find_gripper_actuator(model)
 
-        gripper_idx = find_gripper_actuator(model)
+            # RLDS dataset config (proprio key!)
+            ds_config = tfds.rlds.rlds_base.DatasetConfig(
+                version=tfds.core.Version(DATASET_VERSION),
+                name=DATASET_NAME,
+                observation_info=tfds.features.FeaturesDict({
+                    "proprio": tfds.features.Tensor(shape=(model.nq,), dtype=np.float32),
+                    "language_instruction": tfds.features.Text(),
+                    "image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
+                    "image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
+                }),
+                action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),
+                reward_info=tf.float32,
+                discount_info=tf.float32,
+            )
 
-        # RLDS dataset config
-        ds_config = tfds.rlds.rlds_base.DatasetConfig(
-            version=tfds.core.Version(DATASET_VERSION),
-            name=DATASET_NAME,
-            observation_info=tfds.features.FeaturesDict({
-                "state": tfds.features.Tensor(shape=(model.nq,), dtype=np.float32),
-                "language_instruction": tfds.features.Text(),
-                "image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
-                "image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
-            }),
-            action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),
-            reward_info=tf.float32,
-            discount_info=tf.float32,
-        )
+            base_env = PandaOracleEnv(
+                model, data, arm_act_ids, arm_qpos_addr, ee_ref,
+                language_instruction="Pick the specified tomato by name.",
+                substeps=80, gripper_idx=gripper_idx,
+                arm_dof_idx=arm_dof_idx, kp=PD_KP, kd=PD_KD,
+            )
 
-        base_env = PandaOracleEnv(
-            model, data, arm_act_ids, arm_qpos_addr, ee_ref,
-            language_instruction="Pick the specified tomato by name.",
-            substeps=80, gripper_idx=gripper_idx,
-            arm_dof_idx=arm_dof_idx, kp=PD_KP, kd=PD_KD,
-        )
+            # Precompute targets available on this plant
+            top = _find_top_targets(model, data, k=EPISODES_PER_PLANT, s=0.66)
+            for name, grasp_pos, approach_xy, truss_name in top:
+                print(f"[Target(stem@0.66)] {name}  grasp={grasp_pos}  (Z={grasp_pos[2]:.3f})")
 
-        # Determine the top-2 targets for THIS plant (s=0.66 grasp along stem)
-        top = _find_top_targets(model, data, k=EPISODES_PER_PLANT, s=0.66)
-        for name, grasp_pos, approach_xy, truss_name in top:
-            print(f"[Target(stem@0.66)] {name}  grasp={grasp_pos}  (Z={grasp_pos[2]:.3f})")
+            episodes_here = min(EPISODES_PER_PLANT, EPISODES_TOTAL - episodes_done)
 
-        episodes_here = min(EPISODES_PER_PLANT, EPISODES_TOTAL - episodes_done)
+            # --------- Episode loop ---------
+            for epi in range(episodes_here):
+                try:
+                    # Pick a target for this episode
+                    name, goal_pos, approach_xy, truss_name = top[epi % len(top)]
+                    obstacles = obstacles_all
 
-        # Open a logger around this base_env; close it after these episodes
-        with envlogger.EnvLogger(
-            base_env,
-            backend=tfds_backend_writer.TFDSBackendWriter(
-                data_directory=TFDS_ROOT_DIR,
-                split_name="train",
-                max_episodes_per_file=2,
-                ds_config=ds_config,
-            ),
-        ) as env:
-            try:
-                for epi in range(episodes_here):
-                    stem_name, grasp_pos, approach_xy, truss_name = top[epi]
+                    # Deterministic split per episode count
+                    split_name = choose_split_for_episode(episodes_done)
+                    print(f"[EP] {episodes_done} → split={split_name}  target={name}")
 
-                    # --- robust lateral side selection (keeps approach away from plant center) ---
-                    STEM_R = 0.0025
-                    CLEAR  = 0.0000
-                    offset_mag = STEM_R + CLEAR
-
-                    c_plant, _ = _body_pos(model, data, "tomato_plant")
-                    orth = np.array([approach_xy[1], -approach_xy[0], 0.0], dtype=float)
-                    cand1 = grasp_pos + offset_mag *  orth
-                    cand2 = grasp_pos + offset_mag * (-orth)
-                    goal_pos = cand1 if np.linalg.norm(cand1 - c_plant) > np.linalg.norm(cand2 - c_plant) else cand2
-                    # (This exact pattern is what made the old oracle “approach better”.) :contentReference[oaicite:4]{index=4}
-
-                    # Exclude the active stem & its truss from avoidance if you do that elsewhere
-                    obstacles = [b for b in obstacles_all if b not in (stem_name, truss_name)]
-                    
-                    base_env.lang = f"Pick tomato truss at {stem_name} (plant={plant_idx}, split={split_name})"
-                    # --- QC dry-run (no logging) ---
+                    # ---- QC DRY RUN ----
                     err_final, waypoints = run_oracle_once(
                         env=None, base_env=base_env, model=model, data=data,
                         arm_dof_idx=arm_dof_idx, arm_qpos_addr=arm_qpos_addr, ee_ref=ee_ref,
                         goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
                         waypoints=None, dry_run=True,
                     )
-                    print(f"[QC] executed final |EE-goal| = {err_final:.4f} m")
                     if err_final > MAX_FINAL_ERR:
-                        print("[QC] ❌ Skip episode")
-                        print(f"[PROGRESS] ⏭️  Skipped. Still at {episodes_done}/{EPISODES_TOTAL} saved.")
-
+                        print(f"[QC] ❌ Skip episode (err={err_final:.3f} > {MAX_FINAL_ERR})")
                         continue
-                    print("[QC] ✅ Keep episode")
 
-                    # --- Log the successful episode with the *same* waypoints ---
-                    # --- after QC passes ---
+                    # ---- LOG THE EPISODE ----
+                    dataset_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
+                    os.makedirs(dataset_dir, exist_ok=True)   # <-- make sure 0.0.4 exists
+
                     with envlogger.EnvLogger(
                         base_env,
                         backend=tfds_backend_writer.TFDSBackendWriter(
-                            data_directory=TFDS_ROOT_DIR,
-                            split_name=split_name,                # ← use plant-based split
-                            max_episodes_per_file=2,
-                            ds_config=tfds.rlds.rlds_base.DatasetConfig(
-                                version=tfds.core.Version(DATASET_VERSION),
-                                name=DATASET_NAME,
-                                observation_info=tfds.features.FeaturesDict({
-                                    "state": tfds.features.Tensor(shape=(model.nq,), dtype=np.float32),
-                                    "language_instruction": tfds.features.Text(),
-                                    "image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
-                                    "image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
-                                }),
-                                action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),
-                                reward_info=tf.float32,
-                                discount_info=tf.float32,
-                            ),
+                            data_directory=dataset_dir,
+                            split_name=split_name,           # "train"/"val"/"test"
+                            max_episodes_per_file=8,
+                            ds_config=ds_config,
                         ),
+                        metadata={"language_instruction": base_env.lang},
                     ) as env:
                         run_oracle_once(
-                            env, base_env, model, data, arm_dof_idx, arm_qpos_addr, ee_ref,
+                            env=env, base_env=base_env, model=model, data=data,
+                            arm_dof_idx=arm_dof_idx, arm_qpos_addr=arm_qpos_addr, ee_ref=ee_ref,
                             goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
                             waypoints=waypoints, dry_run=False,
                         )
                         episodes_done += 1
                         print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
+                        _post_write_repair(dataset_dir, DATASET_NAME)
+                except Exception as e:
+                    print(f"[ERROR] Episode failed on plant {plant_idx}, epi {epi}: {e}")
+        
+        finally:
+            plant_idx += 1
 
-
-
-            except Exception as e:
-                print(f"[ERROR] Exception during rollout on plant {plant_idx}: {e}")
-
-        plant_idx += 1
 
     # ---- Safe peek (optional) ----
     dataset_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
-    print(f"✅ RLDS/TFDS episodes written under {dataset_dir}")
+    version_dir = move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)
+    repair_tfds_splits(version_dir, ds_config.name)
+    _post_write_repair(version_dir, DATASET_NAME)
+    print(f"✅ RLDS/TFDS episodes are under: {version_dir}")
+
 
 if __name__ == "__main__":
     main()
