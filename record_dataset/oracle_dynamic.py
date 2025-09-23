@@ -122,12 +122,12 @@ TYPICAL_FRANKA_LIMITS = [
 
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
-EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 200))
+EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 10))
 EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.6")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.7")
 
 # Debug
 DEBUG_IK        = True
@@ -936,29 +936,29 @@ def run_oracle_once(
         period = 1.0 / float(globals().get("LIVE_FPS", 60.0))
 
         if live_qc:
-        # ---- DRY RUN (LIVE) ----
-        base_env.reset(waypoints=waypoints)
-        last_t = time.perf_counter()
-        with viewer.launch_passive(model, data) as v:
-            t_idx = 0
-            N = int(len(waypoints))
-            while v.is_running():
-                # label = (q_{t+1} - q_{t}) / scale
-                i0 = min(t_idx,   N - 1)
-                i1 = min(t_idx+1, N - 1)
-                dq = waypoints[i1, :7] - waypoints[i0, :7]
-                a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
+            # ---- DRY RUN (LIVE) ----
+            base_env.reset(waypoints=waypoints)
+            last_t = time.perf_counter()
+            with viewer.launch_passive(model, data) as v:
+                t_idx = 0
+                N = int(len(waypoints))
+                while v.is_running():
+                    # label = (q_{t+1} - q_{t}) / scale
+                    i0 = min(t_idx,   N - 1)
+                    i1 = min(t_idx+1, N - 1)
+                    dq = waypoints[i1, :7] - waypoints[i0, :7]
+                    a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
 
-                ts = base_env.step(action=a_label)  # <-- base_env, not env
-                t_idx += 1
+                    ts = base_env.step(action=a_label)  # <-- base_env, not env
+                    t_idx += 1
 
-                now = time.perf_counter()
-                if now - last_t < period:
-                    time.sleep(max(0.0, period - (now - last_t)))
-                last_t = now
-                v.sync()
-                if ts.last():
-                    break
+                    now = time.perf_counter()
+                    if now - last_t < period:
+                        time.sleep(max(0.0, period - (now - last_t)))
+                    last_t = now
+                    v.sync()
+                    if ts.last():
+                        break
 
         else:
             # ---- DRY RUN (HEADLESS) ----
@@ -986,32 +986,53 @@ def run_oracle_once(
         print(f"[QC] final |EE - goal| = {err_final:.4f} m")
         return err_final, waypoints
 
-    # ---- LOGGED RUN: execute through EnvLogger-wrapped env
-    if env is None:
-        raise RuntimeError("Logged run requested but `env` is None. Use dry_run=True for QC or pass an EnvLogger.")
+        # ---- LOGGED RUN ----
+        if env is None:
+            raise RuntimeError("Logged run requested but `env` is None. Use dry_run=True for QC or pass an EnvLogger.")
 
-    base_env.set_waypoints(waypoints)
-    env.reset()
-    env.step(np.zeros((7,), np.float32))  # warm-up for FIRST
+        # 1) activate waypoints on the *base* env (not the EnvLogger)
+        base_env.set_waypoints(waypoints)
+        base_env.reset(waypoints=waypoints)   # <-- base env accepts waypoints
 
-    period = 1.0 / float(LIVE_FPS)
-    if LIVE_RENDER:
-        last_t = time.perf_counter()
-        with viewer.launch_passive(model, data) as v:
-            while v.is_running():
-                ts = env.step(action=np.zeros(7, dtype=np.float32))
-                now = time.perf_counter()
-                if now - last_t < period:
-                    time.sleep(max(0.0, period - (now - last_t)))
-                last_t = now
-                v.sync()
+        # 2) now start logging: EnvLogger.reset() takes no kwargs
+        env.reset()                           # <-- emit FIRST to logger
+
+        period = 1.0 / float(LIVE_FPS)
+        N = int(len(waypoints))
+        t_idx = 0
+
+        if LIVE_RENDER:
+            last_t = time.perf_counter()
+            with viewer.launch_passive(model, data) as v:
+                while v.is_running():
+                    # label = (q_{t+1} - q_{t}) / DATASET_ACTION_SCALE
+                    i0 = min(t_idx,   N - 1)
+                    i1 = min(t_idx+1, N - 1)
+                    dq = waypoints[i1, :7] - waypoints[i0, :7]
+                    a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
+
+                    ts = env.step(action=a_label)  # <-- non-zero action is logged
+                    t_idx += 1
+
+                    now = time.perf_counter()
+                    if now - last_t < period:
+                        time.sleep(max(0.0, period - (now - last_t)))
+                    last_t = now
+                    v.sync()
+                    if ts.last():
+                        break
+        else:
+            while True:
+                i0 = min(t_idx,   N - 1)
+                i1 = min(t_idx+1, N - 1)
+                dq = waypoints[i1, :7] - waypoints[i0, :7]
+                a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
+
+                ts = env.step(action=a_label)  # <-- non-zero action is logged
+                t_idx += 1
                 if ts.last():
                     break
-    else:
-        while True:
-            ts = env.step(action=np.zeros(7, dtype=np.float32))
-            if ts.last():
-                break
+
 
     ee_pos, _ = _ee_pose(model, data, ee_ref)
     err_final = float(np.linalg.norm(goal_pos - ee_pos))
@@ -1112,14 +1133,15 @@ def main():
                         continue
 
                     # ---- LOG THE EPISODE ----
-                    dataset_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
-                    os.makedirs(dataset_dir, exist_ok=True)   # <-- make sure 0.0.4 exists
+                    # Let EnvLogger write shards into the ROOT; we’ll move them under name/version.
+                    dataset_root = TFDS_ROOT_DIR
+                    os.makedirs(dataset_root, exist_ok=True)
 
                     with envlogger.EnvLogger(
                         base_env,
                         backend=tfds_backend_writer.TFDSBackendWriter(
-                            data_directory=dataset_dir,
-                            split_name=split_name,           # "train"/"val"/"test"
+                            data_directory=dataset_root,          # <--- CHANGED (was dataset_dir)
+                            split_name=split_name,
                             max_episodes_per_file=8,
                             ds_config=ds_config,
                         ),
@@ -1133,20 +1155,23 @@ def main():
                         )
                         episodes_done += 1
                         print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
-                        _post_write_repair(dataset_dir, DATASET_NAME)
+
+                    # Immediately move any fresh shards into name/version and repair split table.
+                    version_dir = move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)   # <--- ADDED
+                    repair_tfds_splits(version_dir, ds_config.name)                               # <--- ADDED
                 except Exception as e:
                     print(f"[ERROR] Episode failed on plant {plant_idx}, epi {epi}: {e}")
-        
+
         finally:
             plant_idx += 1
 
 
     # ---- Safe peek (optional) ----
-    dataset_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
     version_dir = move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)
     repair_tfds_splits(version_dir, ds_config.name)
     _post_write_repair(version_dir, DATASET_NAME)
     print(f"✅ RLDS/TFDS episodes are under: {version_dir}")
+
 
 
 if __name__ == "__main__":
