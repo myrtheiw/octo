@@ -59,6 +59,7 @@ from helpers import (
     _repair_tfds_splits_at_dir as repair_tfds_splits,
     _expected_ds_dir as expected_ds_dir,
     _move_stray_shards_into_version_dir as move_stray_shards_into_version_dir,
+    _harvest_tfrecords_anywhere as harvest_tfrecords_anywhere
 )
 
 # ------------------------------- Config ---------------------------------------
@@ -1133,14 +1134,14 @@ def main():
                         continue
 
                     # ---- LOG THE EPISODE ----
-                    # Let EnvLogger write shards into the ROOT; we’ll move them under name/version.
-                    dataset_root = TFDS_ROOT_DIR
+                    dataset_root   = TFDS_ROOT_DIR                                     # <- write to ROOT
+                    version_dir    = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
                     os.makedirs(dataset_root, exist_ok=True)
 
                     with envlogger.EnvLogger(
                         base_env,
                         backend=tfds_backend_writer.TFDSBackendWriter(
-                            data_directory=dataset_root,          # <--- CHANGED (was dataset_dir)
+                            data_directory=dataset_root,                                # <- ROOT
                             split_name=split_name,
                             max_episodes_per_file=8,
                             ds_config=ds_config,
@@ -1153,12 +1154,14 @@ def main():
                             goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
                             waypoints=waypoints, dry_run=False,
                         )
-                        episodes_done += 1
-                        print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
 
-                    # Immediately move any fresh shards into name/version and repair split table.
-                    version_dir = move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)   # <--- ADDED
-                    repair_tfds_splits(version_dir, ds_config.name)                               # <--- ADDED
+                    episodes_done += 1
+                    print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
+
+                    # Harvest any shards writer produced anywhere under TFDS_ROOT_DIR
+                    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
+                    # Then repair dataset_info.json splits
+                    repair_tfds_splits(version_dir, DATASET_NAME)
                 except Exception as e:
                     print(f"[ERROR] Episode failed on plant {plant_idx}, epi {epi}: {e}")
 
@@ -1166,11 +1169,14 @@ def main():
             plant_idx += 1
 
 
-    # ---- Safe peek (optional) ----
-    version_dir = move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)
-    repair_tfds_splits(version_dir, ds_config.name)
-    _post_write_repair(version_dir, DATASET_NAME)
+    # ---- Final harvest & summary ----
+    version_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
+    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, "train")
+    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, "val")
+    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, "test")
+    repair_tfds_splits(version_dir, DATASET_NAME)
     print(f"✅ RLDS/TFDS episodes are under: {version_dir}")
+
 
 
 
