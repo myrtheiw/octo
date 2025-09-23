@@ -43,18 +43,31 @@ def expected_ds_dir(root_dir, ds_config):
     return os.path.join(root_dir, ds_config.name, str(ds_config.version))
 
 def move_stray_shards_into_version_dir(root_dir, ds_config):
-    """If any *.tfrecord-* shards are sitting in root_dir, move them under name/version."""
-    expected = _expected_ds_dir(root_dir, ds_config)
+    """Recursively find any *.tfrecord-* shards under root_dir and move them into
+    <root_dir>/<name>/<version>/, preserving the shard suffix."""
+    expected = expected_ds_dir(root_dir, ds_config)
     os.makedirs(expected, exist_ok=True)
 
-    # Shards should be like tomato_rlds-<split>.tfrecord-00000...
-    shard_pat = os.path.join(root_dir, f"{ds_config.name}-*.tfrecord-*")
-    stray = sorted(glob.glob(shard_pat))
+    # Pick up shards even if EnvLogger created nested subdirs
+    pattern = os.path.join(root_dir, "**", f"{ds_config.name}-*.tfrecord-*")
+    stray = sorted(glob.glob(pattern, recursive=True))
     moved = 0
-    for f in stray:
-        dest = os.path.join(expected, os.path.basename(f))
-        if os.path.abspath(f) != os.path.abspath(dest):
-            shutil.move(f, dest)
+    for src in stray:
+        # Skip ones already in the expected dir
+        if os.path.commonpath([os.path.abspath(src), os.path.abspath(expected)]) == os.path.abspath(expected):
+            continue
+        dest = os.path.join(expected, os.path.basename(src))
+        try:
+            shutil.move(src, dest)
+            moved += 1
+        except Exception:
+            # If a same-named shard exists, make a unique name
+            base, ext = os.path.splitext(os.path.basename(src))
+            i = 1
+            while os.path.exists(dest):
+                dest = os.path.join(expected, f"{base}.{i}{ext}")
+                i += 1
+            shutil.move(src, dest)
             moved += 1
     if moved:
         print(f"[TFDS] Moved {moved} stray shard(s) into {expected}")
@@ -99,6 +112,10 @@ def repair_tfds_splits_at_dir(version_dir, name):
     with open(info_p, "w") as fh:
         json.dump(info, fh, indent=2)
     print(f"[TFDS] Rewrote split table: {', '.join(sorted(shards_by_split.keys()))}")
+
+# --- Back-compat alias used by older call sites ---
+def repair_tfds_splits(version_dir, name):
+    return repair_tfds_splits_at_dir(version_dir, name)
 
 
 def choose_split_for_episode(ep_idx: int) -> str:
@@ -355,7 +372,40 @@ def find_side_stem_targets(model, data, k=2, s=0.66):
     ordered = sorted(items, key=lambda t: float(t[1][2]), reverse=True)
     return ordered[:k]
 
+def harvest_any_tfrecords(root_dir: str, version_dir: str, ds_name: str, split_name: str) -> int:
+    """Recursively find any *.tfrecord* under root_dir and move/rename them to:
+       {version_dir}/{ds_name}-{split_name}.tfrecord-<suffix>.
+       Returns number of files moved."""
+    import glob, os, shutil
+    os.makedirs(version_dir, exist_ok=True)
+    moved = 0
+    for src in sorted(glob.glob(os.path.join(root_dir, "**", "*.tfrecord*"), recursive=True)):
+        # skip already-in-place files
+        if os.path.commonpath([os.path.abspath(src), os.path.abspath(version_dir)]) == os.path.abspath(version_dir):
+            continue
+        base = os.path.basename(src)
+        # keep shard suffix if present, else synthesize one
+        if ".tfrecord-" in base:
+            suffix = base.split(".tfrecord-", 1)[1]
+        else:
+            suffix = "00000-of-00001"
+        dest = os.path.join(version_dir, f"{ds_name}-{split_name}.tfrecord-{suffix}")
+        if os.path.exists(dest):
+            i = 1
+            while True:
+                alt = os.path.join(version_dir, f"{ds_name}-{split_name}.tfrecord-{i:05d}-of-00100")
+                if not os.path.exists(alt):
+                    dest = alt
+                    break
+                i += 1
+        shutil.move(src, dest)
+        moved += 1
+    if moved:
+        print(f"[TFDS] Harvested {moved} shard(s) into {version_dir}")
+    return moved
 
+def repair_tfds_splits(version_dir, name):
+    return repair_tfds_splits_at_dir(version_dir, name)
 
 # Backward-compatible aliases (so you can import with underscores if you like)
 _damped_pinv = damped_pinv
@@ -375,6 +425,8 @@ _choose_split_for_episode = choose_split_for_episode
 _expected_ds_dir = expected_ds_dir
 _move_stray_shards_into_version_dir = move_stray_shards_into_version_dir
 _repair_tfds_splits_at_dir = repair_tfds_splits_at_dir
+_harvest_any_tfrecords = harvest_any_tfrecords
+_repair_tfds_splits = repair_tfds_splits
 # ------------------------------- Self-test ------------------------------------
 
 def approx_body_radius_max(model, body_id, pad=0.01, default=0.03):

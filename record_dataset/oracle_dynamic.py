@@ -59,7 +59,8 @@ from helpers import (
     _repair_tfds_splits_at_dir as repair_tfds_splits,
     _expected_ds_dir as expected_ds_dir,
     _move_stray_shards_into_version_dir as move_stray_shards_into_version_dir,
-    _harvest_tfrecords_anywhere as harvest_tfrecords_anywhere
+    _harvest_any_tfrecords as harvest_any_tfrecords,
+    _repair_tfds_splits as repair_tfds_splits,
 )
 
 # ------------------------------- Config ---------------------------------------
@@ -123,7 +124,7 @@ TYPICAL_FRANKA_LIMITS = [
 
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
-EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 10))
+EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 2))
 EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
@@ -788,15 +789,13 @@ def run_oracle_once(
     mujoco.mj_forward(model, data)
     q_start = data.qpos[arm_qpos_addr].copy()
 
-    # ---- tunables for robust grasp timing (add these near your config if you want)
-    GOAL_SETTLE_STEPS   = 60            # extra frames holding exactly at the goal before closing
-    GRASP_START_DIST    = 0.006         # meters; start closing when EE is within 6 mm of goal
-    MIN_CLOSE_IDX_MARGIN= 4             # don't start closing sooner than a few frames after reaching goal
-    # NOTE: if you see *very* slow tracking, increase GOAL_SETTLE_STEPS to 50–60.
+    # ---- tunables for robust grasp timing
+    GOAL_SETTLE_STEPS   = 60
+    GRASP_START_DIST    = 0.006
+    MIN_CLOSE_IDX_MARGIN= 4
 
     # ---- Plan & build waypoints if not supplied
     if waypoints is None:
-        # --- plan cartesian → joint waypoints
         traj_q, phase_idx = plan_cartesian_to_joint_traj(
             model, data, q_start, goal_pos,
             arm_dof_idx, arm_qpos_addr, ee_ref,
@@ -808,10 +807,9 @@ def run_oracle_once(
         end_pre, end_goal, end_ret = phase_idx
         rep = int(WAYPOINT_REPEAT)
 
-        # repeat for slower motion
         traj_q_rep = np.repeat(traj_q, repeats=rep, axis=0)
 
-        # pregrasp dwell (open) — make it ~1 second of sim time
+        # pregrasp dwell
         sim_dt = float(model.opt.timestep) * float(getattr(base_env, "substeps", 40))
         dwell_pre_steps = int(np.ceil(float(globals().get("PREGRASP_DWELL_SEC", 1.0)) / max(sim_dt, 1e-9)))
         dwell_pre = np.repeat(
@@ -820,12 +818,10 @@ def run_oracle_once(
         )
         print(f"[DWELL] pregrasp: {dwell_pre_steps} steps ≈ {dwell_pre_steps*sim_dt:.2f}s")
 
-        # goal settle (to let PD stop “ringing”)
-        GOAL_SETTLE_STEPS   = 60
+        # goal settle dwell
         goal_frame = traj_q_rep[end_goal*rep + (rep-1) : end_goal*rep + rep]
         dwell_goal = np.repeat(goal_frame, repeats=GOAL_SETTLE_STEPS, axis=0)
 
-        # stitch joints (no retreat): [..pre] + dwell_pre + (pre→goal] + dwell_goal + (goal→end]
         traj_q_full = np.concatenate(
             [
                 traj_q_rep[: (end_pre+1)*rep],
@@ -837,17 +833,15 @@ def run_oracle_once(
             axis=0
         )
 
-        # ---------- MICRO-CENTERING SHIM (measures lateral bias during goal dwell) ----------
+        # ---- MICRO-CENTERING SHIM
         idx_pre_end          = (end_pre+1)*rep
         idx_goal_start       = idx_pre_end + dwell_pre_steps
-
         idx_goal_end         = idx_goal_start + (end_goal - end_pre)*rep
         idx_dwell_goal_start = idx_goal_end
         idx_dwell_goal_end   = idx_goal_end + GOAL_SETTLE_STEPS
 
         n_app  = _approach_normal_lateral(model, data, goal_pos)
-        orth_u = np.array([-n_app[1], n_app[0], 0.0], float)
-        orth_u /= (np.linalg.norm(orth_u) + 1e-9)
+        orth_u = np.array([-n_app[1], n_app[0], 0.0], float); orth_u /= (np.linalg.norm(orth_u) + 1e-9)
 
         _bak = data.qpos.copy()
         ees = []
@@ -873,13 +867,12 @@ def run_oracle_once(
                 axis=0
             )
             idx_dwell_goal_end += len(micro)
-        # ---------- END SHIM ----------
-        # ---- Roll the wrist (last joint) during the goal dwell, before closing ----
-        j_roll = 6  # last of the 7 arm joints in traj_q_* arrays
+        # ---- END SHIM
 
-        # We’ll apply the roll over the *end* of the goal-dwell window so it finishes before closing.
-        i1 = int(idx_dwell_goal_end)                                 # end of dwell
-        i0 = int(max(idx_dwell_goal_start, i1 - ROLL_RAMP_STEPS))    # start of ramp inside dwell
+        # wrist roll during dwell
+        j_roll = 6
+        i1 = int(idx_dwell_goal_end)
+        i0 = int(max(idx_dwell_goal_start, i1 - ROLL_RAMP_STEPS))
         if i1 > i0:
             roll0 = float(traj_q_full[i0 - 1, j_roll] if i0 > 0 else traj_q_full[0, j_roll])
             roll1 = roll0 + np.deg2rad(float(HAND_ROLL_AT_GRASP_DEG))
@@ -890,13 +883,12 @@ def run_oracle_once(
         else:
             print("[WRIST] (skipped) dwell too short for roll ramp")
 
-        # add final hold AFTER any splicing so lengths match
         traj_q_hold = np.concatenate(
             [traj_q_full, np.repeat(traj_q_full[-1][None, :], EXTRA_HOLD_STEPS, axis=0)],
             axis=0
         )
 
-        # distance-based grasp timing (robust)
+        # distance-based grasp timing
         _bak = data.qpos.copy()
         dists = []
         for q in traj_q_full:
@@ -905,13 +897,11 @@ def run_oracle_once(
             dists.append(float(np.linalg.norm(goal_pos - ee)))
         data.qpos[:] = _bak; mujoco.mj_forward(model, data)
 
-        GRASP_START_DIST      = 0.006
-        MIN_CLOSE_IDX_MARGIN  = 4
         idx_close = next((i for i, d in enumerate(dists) if d <= GRASP_START_DIST), len(dists) - 1)
         close_start = max(idx_dwell_goal_end + MIN_CLOSE_IDX_MARGIN, idx_close)
         close_start = min(close_start, len(traj_q_full) - 1)
 
-        # gripper ramp (reduces finger chatter)
+        # gripper ramp
         N = len(traj_q_hold)
         GRIP_OPEN, GRIP_CLOSE = 1.0, 0.0
         GRIPPER_RAMP_STEPS    = 25
@@ -922,7 +912,7 @@ def run_oracle_once(
 
         waypoints = np.concatenate([traj_q_hold, grip[:, None]], axis=1).astype(np.float32)
 
-    # ---- DRY RUN: execute without logging (optional QC)
+    # ---- DRY RUN: execute without logging
     if dry_run:
         try:
             prev_cap = getattr(base_env, "_capture_images", True)
@@ -937,20 +927,17 @@ def run_oracle_once(
         period = 1.0 / float(globals().get("LIVE_FPS", 60.0))
 
         if live_qc:
-            # ---- DRY RUN (LIVE) ----
             base_env.reset(waypoints=waypoints)
             last_t = time.perf_counter()
             with viewer.launch_passive(model, data) as v:
                 t_idx = 0
                 N = int(len(waypoints))
                 while v.is_running():
-                    # label = (q_{t+1} - q_{t}) / scale
                     i0 = min(t_idx,   N - 1)
                     i1 = min(t_idx+1, N - 1)
                     dq = waypoints[i1, :7] - waypoints[i0, :7]
                     a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
-
-                    ts = base_env.step(action=a_label)  # <-- base_env, not env
+                    ts = base_env.step(action=a_label)
                     t_idx += 1
 
                     now = time.perf_counter()
@@ -960,9 +947,7 @@ def run_oracle_once(
                     v.sync()
                     if ts.last():
                         break
-
         else:
-            # ---- DRY RUN (HEADLESS) ----
             base_env.reset(waypoints=waypoints)
             t_idx = 0
             N = int(len(waypoints))
@@ -971,8 +956,7 @@ def run_oracle_once(
                 i1 = min(t_idx+1, N - 1)
                 dq = waypoints[i1, :7] - waypoints[i0, :7]
                 a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
-
-                ts = base_env.step(action=a_label)  # <-- base_env, not env
+                ts = base_env.step(action=a_label)
                 t_idx += 1
                 if ts.last():
                     break
@@ -987,58 +971,53 @@ def run_oracle_once(
         print(f"[QC] final |EE - goal| = {err_final:.4f} m")
         return err_final, waypoints
 
-        # ---- LOGGED RUN ----
-        if env is None:
-            raise RuntimeError("Logged run requested but `env` is None. Use dry_run=True for QC or pass an EnvLogger.")
+    # ---- LOGGED RUN ----
+    if env is None:
+        raise RuntimeError("Logged run requested but `env` is None. Use dry_run=True for QC or pass an EnvLogger.")
 
-        # 1) activate waypoints on the *base* env (not the EnvLogger)
-        base_env.set_waypoints(waypoints)
-        base_env.reset(waypoints=waypoints)   # <-- base env accepts waypoints
+    base_env.set_waypoints(waypoints)
+    base_env.reset(waypoints=waypoints)
 
-        # 2) now start logging: EnvLogger.reset() takes no kwargs
-        env.reset()                           # <-- emit FIRST to logger
+    # EnvLogger.reset() takes no kwargs
+    env.reset()
 
-        period = 1.0 / float(LIVE_FPS)
-        N = int(len(waypoints))
-        t_idx = 0
-
-        if LIVE_RENDER:
-            last_t = time.perf_counter()
-            with viewer.launch_passive(model, data) as v:
-                while v.is_running():
-                    # label = (q_{t+1} - q_{t}) / DATASET_ACTION_SCALE
-                    i0 = min(t_idx,   N - 1)
-                    i1 = min(t_idx+1, N - 1)
-                    dq = waypoints[i1, :7] - waypoints[i0, :7]
-                    a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
-
-                    ts = env.step(action=a_label)  # <-- non-zero action is logged
-                    t_idx += 1
-
-                    now = time.perf_counter()
-                    if now - last_t < period:
-                        time.sleep(max(0.0, period - (now - last_t)))
-                    last_t = now
-                    v.sync()
-                    if ts.last():
-                        break
-        else:
-            while True:
+    period = 1.0 / float(LIVE_FPS)
+    N = int(len(waypoints))
+    t_idx = 0
+    if LIVE_RENDER:
+        last_t = time.perf_counter()
+        with viewer.launch_passive(model, data) as v:
+            while v.is_running():
                 i0 = min(t_idx,   N - 1)
                 i1 = min(t_idx+1, N - 1)
                 dq = waypoints[i1, :7] - waypoints[i0, :7]
                 a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
-
-                ts = env.step(action=a_label)  # <-- non-zero action is logged
+                ts = env.step(action=a_label)
                 t_idx += 1
+                now = time.perf_counter()
+                if now - last_t < period:
+                    time.sleep(max(0.0, period - (now - last_t)))
+                last_t = now
+                v.sync()
                 if ts.last():
                     break
+    else:
+        while True:
+            i0 = min(t_idx,   N - 1)
+            i1 = min(t_idx+1, N - 1)
+            dq = waypoints[i1, :7] - waypoints[i0, :7]
+            a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
+            ts = env.step(action=a_label)
+            t_idx += 1
+            if ts.last():
+                break
 
-
+    # final error + return (mirror dry-run)
     ee_pos, _ = _ee_pose(model, data, ee_ref)
     err_final = float(np.linalg.norm(goal_pos - ee_pos))
     print(f"[RUN] final |EE - goal| = {err_final:.4f} m")
     return err_final, waypoints
+
 
 # ----------------------------------- Main -------------------------------------
 
@@ -1134,15 +1113,16 @@ def main():
                         continue
 
                     # ---- LOG THE EPISODE ----
-                    dataset_root   = TFDS_ROOT_DIR                                     # <- write to ROOT
-                    version_dir    = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
+                    dataset_root = TFDS_ROOT_DIR                                   # write to ROOT
+                    version_dir  = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
                     os.makedirs(dataset_root, exist_ok=True)
+                    os.makedirs(version_dir,  exist_ok=True)
 
                     with envlogger.EnvLogger(
                         base_env,
                         backend=tfds_backend_writer.TFDSBackendWriter(
-                            data_directory=dataset_root,                                # <- ROOT
-                            split_name=split_name,
+                            data_directory=dataset_root,                           # ROOT (robust)
+                            split_name=split_name,                                 # "train"/"val"/"test"
                             max_episodes_per_file=8,
                             ds_config=ds_config,
                         ),
@@ -1158,9 +1138,12 @@ def main():
                     episodes_done += 1
                     print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
 
-                    # Harvest any shards writer produced anywhere under TFDS_ROOT_DIR
-                    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
-                    # Then repair dataset_info.json splits
+                    # Sweep any shards the writer dropped anywhere into the version dir, then repair splits
+                    harvest_any_tfrecords(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
+                    # Ensure dataset_info.json exists (first-episode edge case)
+                    info_p = os.path.join(version_dir, "dataset_info.json")
+                    if not os.path.exists(info_p):
+                        _post_write_repair(version_dir, DATASET_NAME)
                     repair_tfds_splits(version_dir, DATASET_NAME)
                 except Exception as e:
                     print(f"[ERROR] Episode failed on plant {plant_idx}, epi {epi}: {e}")
@@ -1169,12 +1152,16 @@ def main():
             plant_idx += 1
 
 
-    # ---- Final harvest & summary ----
+    # ---- Summary ----
     version_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
-    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, "train")
-    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, "val")
-    harvest_tfrecords_anywhere(TFDS_ROOT_DIR, version_dir, DATASET_NAME, "test")
+    # safety sweep for all splits
+    for split_name in ("train", "val", "test"):
+        harvest_any_tfrecords(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
+    info_p = os.path.join(version_dir, "dataset_info.json")
+    if not os.path.exists(info_p):
+        _post_write_repair(version_dir, DATASET_NAME)
     repair_tfds_splits(version_dir, DATASET_NAME)
+
     print(f"✅ RLDS/TFDS episodes are under: {version_dir}")
 
 
