@@ -1,0 +1,253 @@
+
+
+# ======================== run_inference_sim.py ========================
+#!/usr/bin/env python3
+import os, argparse, time
+import numpy as np
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import jax, jax.numpy as jnp
+from functools import partial
+import mujoco
+from mujoco import viewer
+
+from octo.model.octo_model import OctoModel
+
+from sim_env import (
+    PandaSimEnv, build_arm_mapping_from_model, build_arm_dof_indices,
+    find_gripper_actuator, auto_ee_ref,
+)
+
+try:
+    from helpers import build_and_load_scene as _build_and_load_scene
+except Exception:
+    _build_and_load_scene = None
+
+# --- NEW: resolve experiment directories when a parent checkpoints dir is passed ---
+import glob, os, json
+
+
+def resolve_exp_dirs(path: str):
+    """
+    Return a list of experiment dirs (each containing config.json).
+    If `path` itself is an experiment dir, return [path]. If it is a parent,
+    return all children (recursive) that have a config.json, sorted by mtime
+    (newest first).
+    """
+    path = os.path.expanduser(path)
+    cfg = os.path.join(path, "config.json")
+    if os.path.isfile(cfg):
+        return [path]
+
+    # Find all config.json files under the parent
+    candidates = glob.glob(os.path.join(path, "**", "config.json"), recursive=True)
+    # Filter out the parent itself if matched
+    candidates = [c for c in candidates if os.path.dirname(c) != path]
+    # Sort newest first by file mtime
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    exps = [os.path.dirname(c) for c in candidates]
+
+    if not exps:
+        raise SystemExit(f"Could not find any config.json under: {path}. "
+                         f"Pass --exp to a specific experiment directory.")
+
+    # Pretty-print the top few for clarity (all on one line-safe string)
+    head = "\n  ".join(exps[:5])
+    tail = "\n  ..." if len(exps) > 5 else ""
+    print("[resolve] Found experiments (newest first):\n  " + head + tail)
+
+    return exps
+    
+def _synth_namespaced_timestep(flat: dict):
+    if "observation/pad_mask_dict/timestep" in flat and "observation/timestep_pad_mask" not in flat:
+        flat["observation/timestep_pad_mask"] = flat["observation/pad_mask_dict/timestep"]
+    if "observation/timestep_pad_mask" in flat and "observation/pad_mask_dict/timestep" not in flat:
+        flat["observation/pad_mask_dict/timestep"] = flat["observation/timestep_pad_mask"]
+
+def _add_legacy_aliases(d: dict):
+    for k in ("proprio", "timestep", "task_completed", "image_primary", "image_wrist"):
+        nk = f"observation/{k}"
+        if nk in d and k not in d:
+            d[k] = d[nk]
+    for k in ("proprio", "timestep", "image_primary", "image_wrist"):
+        nk = f"observation/pad_mask_dict/{k}"
+        lk = f"pad_mask_dict/{k}"
+        if nk in d and lk not in d:
+            d[lk] = d[nk]
+    src = d.get("observation/timestep_pad_mask") or d.get("observation/pad_mask_dict/timestep")
+    if src is not None:
+        d.setdefault("timestep_pad_mask", src)
+        d.setdefault("pad_mask_dict/timestep", src)
+
+def supply_rng(fn, seed=0):
+    rng = jax.random.PRNGKey(int(seed))
+    def wrapped(*args, **kwargs):
+        nonlocal rng
+        rng, sub = jax.random.split(rng)
+        try:
+            return fn(*args, rng=sub, **kwargs)
+        except TypeError:
+            try:
+                return fn(*args, prng_key=sub, **kwargs)
+            except TypeError:
+                return fn(*args, **kwargs)
+    return wrapped
+
+def build_obs_for_octo(ts_obs, t_idx: int):
+    img_p = np.asarray(ts_obs["image_primary"], np.uint8)[None, None, ...]
+    img_w = np.asarray(ts_obs["image_wrist"],   np.uint8)[None, None, ...]
+    proprio = np.asarray(ts_obs["proprio"], np.float32)[None, None, ...]
+    timestep = np.array([[t_idx]], np.int32)
+    obs = {
+        "observation/image_primary":  img_p,
+        "observation/image_wrist":    img_w,
+        "observation/proprio":        proprio,
+        "observation/task_completed": np.zeros((1, 1, 4), np.float32),
+        "observation/timestep":       timestep,
+        "observation/pad_mask_dict/image_primary": np.ones((1, 1), bool),
+        "observation/pad_mask_dict/image_wrist":   np.ones((1, 1), bool),
+        "observation/pad_mask_dict/proprio":       np.ones((1, 1), bool),
+        "observation/pad_mask_dict/timestep":      np.ones((1, 1), bool),
+    }
+    _synth_namespaced_timestep(obs)
+    _add_legacy_aliases(obs)
+    return obs
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--exp", required=True, help="Octo experiment directory OR a parent containing experiment_*/config.json")
+    ap.add_argument("--per_exp_steps", type=int, default=None, help="If multiple experiments are found under --exp, run this many steps per experiment (defaults to --max_steps)")
+    ap.add_argument("--model_xml", default=os.environ.get("MODEL_XML", ""), help="Path to MuJoCo scene xml")
+    ap.add_argument("--dynamic_plant", action="store_true", help="Regenerate random plant (requires helpers.py)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--use_language", action="store_true", default=False)
+    ap.add_argument("--fps", type=float, default=60.0)
+    ap.add_argument("--max_steps", type=int, default=600)
+    ap.add_argument("--substeps", type=int, default=80)
+    ap.add_argument("--kp", type=float, default=120.0)
+    ap.add_argument("--action_scale", type=float, default=0.05)
+    args = ap.parse_args()
+
+    exp_dirs = resolve_exp_dirs(args.exp)
+    steps_per = int(args.per_exp_steps or args.max_steps)
+
+    # Build sim once
+    if args.dynamic_plant and _build_and_load_scene is not None:
+        sim_model, sim_data = _build_and_load_scene(args.model_xml or "")
+    else:
+        if not args.model_xml:
+            raise SystemExit("--model_xml is required (or use --dynamic_plant with helpers.py).")
+        sim_model = mujoco.MjModel.from_xml_path(args.model_xml)
+        sim_data  = mujoco.MjData(sim_model)
+        mujoco.mj_forward(sim_model, sim_data)
+
+    arm_act_ids, arm_qpos_addr = build_arm_mapping_from_model(sim_model, prefer_position=True)
+    arm_dof_idx = build_arm_dof_indices(sim_model, arm_act_ids)
+    gripper_idx = find_gripper_actuator(sim_model)
+    ee_ref = auto_ee_ref(sim_model, sim_data)
+    print(f"[sim] EE ref: {ee_ref}  gripper_idx={gripper_idx}")
+
+    env = PandaSimEnv(
+        sim_model, sim_data, arm_act_ids, arm_qpos_addr, ee_ref,
+        substeps=args.substeps, gripper_idx=gripper_idx, arm_dof_idx=arm_dof_idx,
+        kp=args.kp, kd=None, action_scale=args.action_scale,
+    )
+
+    period = 1.0 / max(1e-6, float(args.fps))
+
+    with viewer.launch_passive(sim_model, sim_data) as v:
+        for i, exp_dir in enumerate(exp_dirs, 1):
+            print(f"\n[load] ({i}/{len(exp_dirs)}) Octo from: {exp_dir}")
+            model = OctoModel.load_pretrained(exp_dir)
+            model = OctoModel.load_pretrained(exp_dir)
+            if args.use_language:
+                task = model.create_tasks(texts=["Pick the tomato."])
+            else:
+                task = model.create_tasks(goal_images=np.zeros((1, 256, 256, 3), np.uint8))
+            policy = supply_rng(
+                partial(model.sample_actions,
+                        unnormalization_statistics=model.dataset_statistics["action"]),
+                seed=args.seed,
+            )
+            ts = env.reset()
+            t_last = time.perf_counter()
+            for step in range(steps_per):
+                if not v.is_running():
+                    break
+                obs_for_octo = build_obs_for_octo(ts.observation, t_idx=step)
+                act_tree = policy(obs_for_octo, task)
+                leaves = jax.tree_util.tree_leaves(act_tree)
+                a = np.zeros((7,), np.float32) if not leaves else np.asarray(leaves[0]).reshape(-1)[:7].astype(np.float32)
+                ts = env.step(a)
+                now = time.perf_counter()
+                dt = now - t_last
+                if dt < period:
+                    time.sleep(max(0.0, period - dt))
+                t_last = now
+                v.sync()
+            print(f"[done] steps={step+1} for {exp_dir}")
+
+    print("[all done]")
+
+    if args.use_language:
+        task = model.create_tasks(texts=["Pick the tomato."])
+    else:
+        task = model.create_tasks(goal_images=np.zeros((1, 256, 256, 3), np.uint8))
+
+    if args.dynamic_plant and _build_and_load_scene is not None:
+        sim_model, sim_data = _build_and_load_scene(args.model_xml or "")
+    else:
+        if not args.model_xml:
+            raise SystemExit("--model_xml is required (or use --dynamic_plant with helpers.py).")
+        sim_model = mujoco.MjModel.from_xml_path(args.model_xml)
+        sim_data  = mujoco.MjData(sim_model)
+        mujoco.mj_forward(sim_model, sim_data)
+
+    arm_act_ids, arm_qpos_addr = build_arm_mapping_from_model(sim_model, prefer_position=True)
+    arm_dof_idx = build_arm_dof_indices(sim_model, arm_act_ids)
+    gripper_idx = find_gripper_actuator(sim_model)
+    ee_ref = auto_ee_ref(sim_model, sim_data)
+    print(f"[sim] EE ref: {ee_ref}  gripper_idx={gripper_idx}")
+
+    env = PandaSimEnv(
+        sim_model, sim_data, arm_act_ids, arm_qpos_addr, ee_ref,
+        substeps=args.substeps, gripper_idx=gripper_idx, arm_dof_idx=arm_dof_idx,
+        kp=args.kp, kd=None, action_scale=args.action_scale,
+    )
+    ts = env.reset()
+
+    policy = supply_rng(
+        partial(model.sample_actions,
+                unnormalization_statistics=model.dataset_statistics["action"]),
+        seed=args.seed,
+    )
+
+    period = 1.0 / max(1e-6, float(args.fps))
+    t_last = time.perf_counter()
+    steps = 0
+
+    with viewer.launch_passive(sim_model, sim_data) as v:
+        while v.is_running() and steps < int(args.max_steps):
+            obs_for_octo = build_obs_for_octo(ts.observation, t_idx=steps)
+            act_tree = policy(obs_for_octo, task)
+            leaves = jax.tree_util.tree_leaves(act_tree)
+            if not leaves:
+                a = np.zeros((7,), np.float32)
+            else:
+                a0 = np.asarray(leaves[0])
+                a = a0.reshape(-1)[:7].astype(np.float32)
+            ts = env.step(a)
+            steps += 1
+            now = time.perf_counter()
+            if now - t_last < period:
+                time.sleep(max(0.0, period - (now - t_last)))
+            t_last = now
+            v.sync()
+
+    print(f"[done] steps={steps}")
+
+if __name__ == "__main__":
+    main()
