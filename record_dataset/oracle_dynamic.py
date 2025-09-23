@@ -124,12 +124,12 @@ TYPICAL_FRANKA_LIMITS = [
 
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
-EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 2))
+EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 200))
 EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.7")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.8")
 
 # Debug
 DEBUG_IK        = True
@@ -154,24 +154,27 @@ DATASET_ACTION_SCALE = 0.05  # must match the --action_scale used at inference
 
 # --------------------------- Model/Actuator mapping ---------------------------
 def _post_write_repair(dataset_dir: str, dataset_name: str):
-    """Make shard names TFDS-friendly and (re)write dataset_info.json splits."""
+    """
+    Make shard names TFDS-friendly and safely update dataset_info.json:
+    - Never discard existing TFDS metadata (features/schema/etc.)
+    - Only update: splits (numShards/shardLengths/numBytes), fileFormat (if missing)
+    """
     import os as _os, glob as _glob, json as _json, tensorflow as _tf
 
     _os.makedirs(dataset_dir, exist_ok=True)
 
-    # 1) Force the '-of-' suffix for any single-shard files envlogger makes.
+    # 1) Force the '-of-' suffix for single-shard files (envlogger sometimes omits it)
     for p in list(_glob.glob(_os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-*"))):
         b = _os.path.basename(p)
-        # e.g. tomato_rlds-train.tfrecord-00000  ->  tomato_rlds-train.tfrecord-00000-of-00001
         if b.endswith(".tfrecord-00000") and "-of-" not in b:
             nb = b.replace(".tfrecord-00000", ".tfrecord-00000-of-00001")
             _os.rename(p, _os.path.join(dataset_dir, nb))
 
-    # 2) Gather shards for each split (support both suffixed and legacy names).
+    # 2) Collect shards per split
     split_to_files = {}
     patterns = [
         _os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-*-of-*"),
-        _os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-0000*"),  # fallback if rename failed
+        _os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-0000*"),  # legacy fallback
     ]
     seen = set()
     for pat in patterns:
@@ -180,31 +183,33 @@ def _post_write_repair(dataset_dir: str, dataset_name: str):
                 continue
             seen.add(p)
             base = _os.path.basename(p)
-            # tomato_rlds-<split>.tfrecord-...
+            # Expect tomato_rlds-<split>.tfrecord-...
             try:
                 split = base.split("-")[1].split(".")[0]
             except Exception:
                 continue
             split_to_files.setdefault(split, []).append(p)
 
-    def _count_records(path):
+    def _count_records(path: str) -> int:
         n = 0
         for _ in _tf.data.TFRecordDataset(path):
             n += 1
-        return max(1, n)  # be conservative; TFDS tolerates this
+        return max(1, n)  # be conservative
 
-    # 3) Build split entries (only for splits that have at least one shard file).
-    splits_info = []
+    # 3) Build new split entries (INT shardLengths)
+    new_splits = []
     for sp, files in sorted(split_to_files.items()):
-        shard_lengths = [_count_records(f) for f in files]
-        num_bytes = sum(_os.path.getsize(f) for f in files)
-        splits_info.append({
+        files_sorted = sorted(files)
+        shard_lengths = [_count_records(f) for f in files_sorted]
+        num_bytes = sum(_os.path.getsize(f) for f in files_sorted)
+        new_splits.append({
             "name": sp,
-            "shardLengths": shard_lengths,
-            "numBytes": num_bytes,
+            "numShards": len(files_sorted),
+            "shardLengths": shard_lengths,   # integers
+            "numBytes": int(num_bytes),
         })
 
-    # 4) Write/patch dataset_info.json.
+    # 4) Merge into existing dataset_info.json (preserve features/schema/etc.)
     info_path = _os.path.join(dataset_dir, "dataset_info.json")
     info = {}
     if _os.path.exists(info_path):
@@ -213,9 +218,14 @@ def _post_write_repair(dataset_dir: str, dataset_name: str):
                 info = _json.load(f)
         except Exception:
             info = {}
-    info["name"] = dataset_name
-    info["version"] = _os.path.basename(dataset_dir)  # e.g. "0.0.4"
-    info["splits"] = splits_info
+
+    info.setdefault("name", dataset_name)
+    info["version"] = _os.path.basename(dataset_dir)  # e.g. "0.0.7"
+    # Keep pre-existing "features" and other TFDS fields intact
+    info["splits"] = new_splits
+    # Ensure fileFormat is present for TFDS>=4 read_only builder
+    info.setdefault("fileFormat", "tfrecord")
+
     with open(info_path, "w") as f:
         _json.dump(info, f, indent=2)
 

@@ -25,7 +25,7 @@ def parse_example(example_proto):
     }
     return tf.io.parse_single_example(example_proto, feature_description)
 
-dataset_path = "/home/myrtheiw/octo_ws/octo/record_dataset/dataset/tomato_dataset.tfrecord"
+dataset_path = "/home/myrtheiw/tfds_out/tomato_rlds/0.0.7/tomato_rlds-train.tfrecord-00000-of-00001"
 raw_dataset = tf.data.TFRecordDataset(dataset_path)
 parsed_dataset = raw_dataset.map(parse_example)
 
