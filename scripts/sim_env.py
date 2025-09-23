@@ -99,7 +99,9 @@ def build_arm_mapping_from_model(model, prefer_position=True):
 
     arm_act_ids  = np.array([c[0] for c in chosen], dtype=int)
     arm_qpos_adr = np.array([c[2] for c in chosen], dtype=int)
-    return arm_act_ids, arm_qpos_adr
+    arm_gain_type = np.array([c[5] for c in chosen], dtype=int)  # <--- ADD THIS
+    return arm_act_ids, arm_qpos_adr, arm_gain_type               # <--- CHANGED RETURN
+
 
 def build_arm_dof_indices(model, arm_act_ids):
     pairs = []
@@ -118,7 +120,7 @@ class PandaSimEnv(dm_env.Environment):
     def __init__(self, model, data, arm_act_ids, arm_qpos_addr, ee_ref,
                  substeps=40, gripper_idx=-1, arm_dof_idx=None,
                  kp=120.0, kd=None, action_scale=0.05,
-                 primary_cam=None, wrist_cam=None):
+                 primary_cam=None, wrist_cam=None, arm_gain_type=None): 
         self.model = model; self.data = data
         self.arm_act_ids = np.asarray(arm_act_ids, int)
         self.arm_qpos_addr = np.asarray(arm_qpos_addr, int)
@@ -138,6 +140,13 @@ class PandaSimEnv(dm_env.Environment):
         self.cam_wrist   = wrist_cam   or resolve_camera_name(model, WRIST_CAM_CANDIDATES,   fallback_id=min(1, max(0, int(getattr(model, "ncam", 1)) - 1)))
         self._r_primary = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
         self._r_wrist   = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
+
+        # --- NEW: actuator mode detection ---
+        self.arm_gain_type = np.asarray(arm_gain_type if arm_gain_type is not None else [], int)
+        self._all_position_act = (
+            self.arm_gain_type.size == self.arm_act_ids.size and
+            np.all(self.arm_gain_type == 3)
+        )
 
     def set_capture_images(self, enabled: bool):
         self._capture_images = bool(enabled)
@@ -172,6 +181,8 @@ class PandaSimEnv(dm_env.Environment):
         mujoco.mj_resetData(self.model, self.data)
         self.data.qvel[:] = 0.0
         self.data.qpos[self.arm_qpos_addr] = START_JOINTS
+        if getattr(self, "_all_position_act", False):
+            self.data.ctrl[self.arm_act_ids] = self.data.qpos[self.arm_qpos_addr]   # <--- ADD
         mujoco.mj_forward(self.model, self.data)
         self._t = 0
         img_primary, img_wrist = self._render_images()
@@ -196,15 +207,21 @@ class PandaSimEnv(dm_env.Environment):
         q  = self.data.qpos[self.arm_qpos_addr].copy()
         q_target = self._clamp_to_limits(q + self.action_scale * a)
 
-        for _ in range(self.substeps):
-            q  = self.data.qpos[self.arm_qpos_addr].copy()
-            qd = self.data.qvel[self.arm_dof_idx].copy()
-            u  = self.kp * (q_target - q) - self.kd * qd
-            self.data.ctrl[self.arm_act_ids] = u
-            if 0 <= self.gripper_idx < self.model.nu:
-                self.data.ctrl[self.gripper_idx] = self.data.ctrl[self.gripper_idx]
-            mujoco.mj_step(self.model, self.data)
-
+        if self._all_position_act:
+            # Position actuators: set target directly (outer loop is delta-q)
+            for _ in range(self.substeps):
+                self.data.ctrl[self.arm_act_ids] = q_target
+                mujoco.mj_step(self.model, self.data)
+        else:
+            # Torque actuators: PD torque tracking
+            for _ in range(self.substeps):
+                q  = self.data.qpos[self.arm_qpos_addr].copy()
+                qd = self.data.qvel[self.arm_dof_idx].copy()
+                u  = self.kp * (q_target - q) - self.kd * qd
+                self.data.ctrl[self.arm_act_ids] = u
+                if 0 <= self.gripper_idx < self.model.nu:
+                    self.data.ctrl[self.gripper_idx] = self.data.ctrl[self.gripper_idx]
+                mujoco.mj_step(self.model, self.data)
         self._t += 1
         img_primary, img_wrist = self._render_images()
         return TimeStep(

@@ -121,8 +121,8 @@ def _nearest_downsample(img: np.ndarray, target_hw: tuple[int, int]) -> np.ndarr
 
 def build_obs_for_octo(ts_obs, t_idx: int, img_shapes: dict | None = None):
     """
-    Wrap env obs into Octo format. Optionally resize images to example_batch shapes:
-      img_shapes = {"image_primary": (H, W), "image_wrist": (H, W)}
+    Wrap env obs into Octo format and provide BOTH namespaced and top-level pad masks.
+    This silences 'No pad_mask_dict found' and avoids inputs being ignored.
     """
     img_p = np.asarray(ts_obs["image_primary"], np.uint8)
     img_w = np.asarray(ts_obs["image_wrist"],   np.uint8)
@@ -131,10 +131,13 @@ def build_obs_for_octo(ts_obs, t_idx: int, img_shapes: dict | None = None):
             img_p = _nearest_downsample(img_p, img_shapes["image_primary"])
         if "image_wrist" in img_shapes:
             img_w = _nearest_downsample(img_w, img_shapes["image_wrist"])
+
     img_p = img_p[None, None, ...]  # (1,1,H,W,3)
     img_w = img_w[None, None, ...]
     proprio = np.asarray(ts_obs["proprio"], np.float32)[None, None, ...]
     timestep = np.array([[t_idx]], np.int32)
+
+    # --- base namespaced keys ---
     obs = {
         "observation/image_primary":  img_p,
         "observation/image_wrist":    img_w,
@@ -146,8 +149,15 @@ def build_obs_for_octo(ts_obs, t_idx: int, img_shapes: dict | None = None):
         "observation/pad_mask_dict/proprio":       np.ones((1, 1), bool),
         "observation/pad_mask_dict/timestep":      np.ones((1, 1), bool),
     }
+
+    # --- add legacy/toplevel aliases the checkpoint expects ---
     _synth_namespaced_timestep(obs)
     _add_legacy_aliases(obs)
+    # Critically, also inject TOP-LEVEL pad_mask_dict/* (the warnings complain about these)
+    obs["pad_mask_dict/image_primary"] = np.ones((1, 1), bool)
+    obs["pad_mask_dict/image_wrist"]   = np.ones((1, 1), bool)
+    obs["pad_mask_dict/proprio"]       = np.ones((1, 1), bool)
+    obs["pad_mask_dict/timestep"]      = np.ones((1, 1), bool)
     return obs
 
 def expected_shapes_for(model):
@@ -179,6 +189,11 @@ def main():
     ap.add_argument("--substeps", type=int, default=80)
     ap.add_argument("--kp", type=float, default=120.0)
     ap.add_argument("--action_scale", type=float, default=0.05)
+    ap.add_argument("--task_mode", choices=["language", "goal"], default="language",
+                help="Use language prompt or a blank goal image task (matches many finetunes).")
+    ap.add_argument("--debug_constant_action", type=float, default=None,
+                help="If set, ignore policy and apply a constant delta on joint 1 (radians).")
+
     args = ap.parse_args()
 
     exp_dirs = resolve_exp_dirs(args.exp)
@@ -217,17 +232,26 @@ def main():
         sim_data  = mujoco.MjData(sim_model)
         mujoco.mj_forward(sim_model, sim_data)
 
-    arm_act_ids, arm_qpos_addr = build_arm_mapping_from_model(sim_model, prefer_position=True)
+    # --- NEW: build mapping/env after model+data exist (for BOTH branches) ---
+    arm_act_ids, arm_qpos_addr, arm_gain_type = build_arm_mapping_from_model(
+        sim_model, prefer_position=True
+    )
     arm_dof_idx = build_arm_dof_indices(sim_model, arm_act_ids)
     gripper_idx = find_gripper_actuator(sim_model)
     ee_ref = auto_ee_ref(sim_model, sim_data)
-    print(f"[sim] EE ref: {ee_ref}  gripper_idx={gripper_idx}")
 
     env = PandaSimEnv(
-        sim_model, sim_data, arm_act_ids, arm_qpos_addr, ee_ref,
+        sim_model, sim_data,
+        arm_act_ids, arm_qpos_addr, ee_ref,
         substeps=args.substeps, gripper_idx=gripper_idx, arm_dof_idx=arm_dof_idx,
         kp=args.kp, kd=None, action_scale=args.action_scale,
+        arm_gain_type=arm_gain_type,
     )
+
+    # (optional: tiny debug to confirm position-mode detection)
+    print(f"[actuators] position_mode={getattr(env, '_all_position_act', False)} "
+        f"gain_types={arm_gain_type.tolist()}")
+
 
     period = 1.0 / max(1e-6, float(args.fps))
 
@@ -237,10 +261,13 @@ def main():
             model = OctoModel.load_pretrained(exp_dir)
             img_shapes = expected_shapes_for(model)
             print(f"[shapes] primary={img_shapes['image_primary']} wrist={img_shapes['image_wrist']}")
-            if args.use_language:
+            # BEFORE building policy, right after loading 'model'
+            if args.task_mode == "language":
                 task = model.create_tasks(texts=["Pick the tomato."])
             else:
+                # simple blank goal image; replace with your own if you logged goal frames
                 task = model.create_tasks(goal_images=np.zeros((1, 256, 256, 3), np.uint8))
+
             policy = supply_rng(
                 partial(model.sample_actions,
                         unnormalization_statistics=model.dataset_statistics["action"]),

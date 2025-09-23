@@ -40,10 +40,10 @@ import envlogger
 from envlogger.backends import tfds_backend_writer
 
 # Target detection utils (you already have these)
-from record_dataset.getlocation import get_side_stem_origins_and_quats, get_side_stem_grasp_points
+from getlocation import get_side_stem_origins_and_quats, get_side_stem_grasp_points
 
 # Collision avoidance + dynamic scene helpers (provided in your helpers.py)
-from record_dataset.helpers import (
+from helpers import (
     damped_pinv as _damped_pinv,
     body_pos as _body_pos,
     approx_body_radius_max as _approx_body_radius,
@@ -131,18 +131,22 @@ DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.6")
 
 # Debug
 DEBUG_IK        = True
-LIVE_RENDER     = False
+LIVE_RENDER     = True
 LIVE_FPS        = 60.0
 SHOW_DEBUG_VIZ  = False   # set True to drop mocap frames (pre/goal/retreat)
 
 # --- Quality gate: only log successful episodes ---
 MAX_FINAL_ERR = 0.010      # meters; tighten/loosen for your dataset quality
-LIVE_RENDER_QC = False      # render the QC dry-run, like LIVE_RENDER
+LIVE_RENDER_QC = True      # render the QC dry-run, like LIVE_RENDER
 CAPTURE_IMAGES_DURING_QC = False  # speed up QC (don’t waste time rendering)
 
 
 # Train/val/test ratios (edit as you like)
 SPLIT_RATIOS = dict(train=0.90, val=0.10, test=0.0)
+
+# Add near other config constants
+DATASET_ACTION_SCALE = 0.05  # must match the --action_scale used at inference
+
 
 
 
@@ -644,14 +648,16 @@ class PandaOracleEnv(dm_env.Environment):
         self._T = len(waypoints)
         self._t = 0
 
-    # --- modify reset() to allow policy mode (no waypoints needed) ---
+
     def reset(self, waypoints=None):
+        # waypoints mode: accept either an explicit array OR previously set waypoints
         if self.control_mode == "waypoints":
-            if waypoints is None:
+            if waypoints is not None:
+                self.set_waypoints(waypoints)
+            elif self._waypoints is None:
                 raise ValueError("reset(...): waypoints required in waypoints mode")
-            self.set_waypoints(waypoints)
         else:
-            # policy mode: no waypoints
+            # policy mode: no waypoints required
             self._waypoints = None
             self._T = 0
             self._t = 0
@@ -930,22 +936,43 @@ def run_oracle_once(
         period = 1.0 / float(globals().get("LIVE_FPS", 60.0))
 
         if live_qc:
-            base_env.reset()
-            last_t = time.perf_counter()
-            with viewer.launch_passive(model, data) as v:
-                while v.is_running():
-                    ts = base_env.step(np.zeros(7, dtype=np.float32))
-                    now = time.perf_counter()
-                    if now - last_t < period:
-                        time.sleep(max(0.0, period - (now - last_t)))
-                    last_t = now
-                    v.sync()
-                    if ts.last():
-                        break
+        # ---- DRY RUN (LIVE) ----
+        base_env.reset(waypoints=waypoints)
+        last_t = time.perf_counter()
+        with viewer.launch_passive(model, data) as v:
+            t_idx = 0
+            N = int(len(waypoints))
+            while v.is_running():
+                # label = (q_{t+1} - q_{t}) / scale
+                i0 = min(t_idx,   N - 1)
+                i1 = min(t_idx+1, N - 1)
+                dq = waypoints[i1, :7] - waypoints[i0, :7]
+                a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
+
+                ts = base_env.step(action=a_label)  # <-- base_env, not env
+                t_idx += 1
+
+                now = time.perf_counter()
+                if now - last_t < period:
+                    time.sleep(max(0.0, period - (now - last_t)))
+                last_t = now
+                v.sync()
+                if ts.last():
+                    break
+
         else:
-            base_env.reset()
+            # ---- DRY RUN (HEADLESS) ----
+            base_env.reset(waypoints=waypoints)
+            t_idx = 0
+            N = int(len(waypoints))
             while True:
-                ts = base_env.step(np.zeros(7, dtype=np.float32))
+                i0 = min(t_idx,   N - 1)
+                i1 = min(t_idx+1, N - 1)
+                dq = waypoints[i1, :7] - waypoints[i0, :7]
+                a_label = (dq / float(DATASET_ACTION_SCALE)).astype(np.float32)
+
+                ts = base_env.step(action=a_label)  # <-- base_env, not env
+                t_idx += 1
                 if ts.last():
                     break
 
