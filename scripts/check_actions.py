@@ -146,7 +146,7 @@ def main():
         # Resolve version_dir robustly
         if "/" in args.tfds_name:
             version_dir = os.path.join(args.data_dir, args.tfds_name)
-            ds_name = args.tfds_name.split("/")[-1]
+            ds_name = args.tfds_name.split("/")[0]    # <-- "tomato_rlds"
         else:
             root = os.path.join(args.data_dir, args.tfds_name)
             versions = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]

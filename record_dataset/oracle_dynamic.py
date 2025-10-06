@@ -136,12 +136,12 @@ TYPICAL_FRANKA_LIMITS = [
 
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
-EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 10))
+EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 200))
 EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.19")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.21")
 
 _DEFAULT_GOAL_IMAGE_OUTPUT_DIR = (
     Path(__file__).resolve().parents[1] / "outputs" / "goal_images"

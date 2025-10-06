@@ -1,7 +1,6 @@
 import datetime
 from functools import partial
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Disable CUDA to prevent TensorFlow from using GPU memory
 
 from absl import app, flags, logging
 import flax
@@ -13,68 +12,6 @@ import optax
 import tensorflow as tf
 import tqdm
 import wandb
-import numpy as np
-
-################################## Monkey Patching ##################################
-# ✅ Improved numeric-only filtering while keeping language_instruction
-def fully_numeric_for_stats(traj):
-    cleaned = {}
-    for key, value in traj.items():
-        if isinstance(value, dict):
-            cleaned[key] = fully_numeric_for_stats(value)
-        else:
-            if key == "language_instruction":
-                cleaned[key] = value  # keep as string tensor
-            elif value.dtype.is_floating or value.dtype.is_integer:
-                cleaned[key] = tf.cast(value, tf.float32)
-            else:
-                continue  # drop non-numeric entries entirely
-    return cleaned
-
-def safe_get_dataset_statistics(dataset, hash_dependencies, save_dir=None, force_recompute=False):
-    # Only keep numeric values + language_instruction
-    numeric_dataset = dataset.traj_map(lambda t: fully_numeric_for_stats(t))
-
-    actions_list, proprios_list = [], []
-    num_transitions = num_trajectories = 0
-
-    for traj in numeric_dataset.as_numpy_iterator():
-        # Skip trajectories without numeric action/proprio
-        if "action" not in traj or "observation" not in traj or "proprio" not in traj["observation"]:
-            continue
-        actions_list.append(traj["action"])
-        proprios_list.append(traj["observation"]["proprio"])
-        num_transitions += traj["action"].shape[0]
-        num_trajectories += 1
-
-    actions_arr = np.concatenate(actions_list) if actions_list else np.zeros((0,))
-    proprios_arr = np.concatenate(proprios_list) if proprios_list else np.zeros((0,))
-
-    return {
-        "action": {
-            "mean": actions_arr.mean(axis=0).tolist() if actions_list else [],
-            "std": actions_arr.std(axis=0).tolist() if actions_list else [],
-            "min": actions_arr.min(axis=0).tolist() if actions_list else [],
-            "max": actions_arr.max(axis=0).tolist() if actions_list else [],
-        },
-        "proprio": {
-            "mean": proprios_arr.mean(axis=0).tolist() if proprios_list else [],
-            "std": proprios_arr.std(axis=0).tolist() if proprios_list else [],
-            "min": proprios_arr.min(axis=0).tolist() if proprios_list else [],
-            "max": proprios_arr.max(axis=0).tolist() if proprios_list else [],
-        },
-        "num_transitions": num_transitions,
-        "num_trajectories": num_trajectories
-    }
-
-from octo.data.utils import data_utils
-data_utils.get_dataset_statistics = safe_get_dataset_statistics
-
-
-
-
-######################################################################################
-
 
 from octo.data.dataset import make_single_dataset
 from octo.model.octo_model import OctoModel
@@ -175,22 +112,13 @@ def main(_):
         name=name,
         time=datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
     )
-
     wandb.init(
         config=FLAGS.config.to_dict(),
         id=wandb_id,
         name=name,
-        mode="offline",  # Force offline mode
+        mode="disabled" if FLAGS.debug else None,
         **FLAGS.config.wandb,
     )
-
-    # wandb.init(
-    #     config=FLAGS.config.to_dict(),
-    #     id=wandb_id,
-    #     name=name,
-    #     mode="disabled" if FLAGS.debug else None,
-    #     **FLAGS.config.wandb,
-    # )
 
     #########
     #
@@ -232,18 +160,14 @@ def main(_):
     def process_batch(batch):
         batch = process_text(batch, text_processor)
         del batch["dataset_name"]
-        for batch in dataset.take(1):
-            print("Batch keys:", batch.keys())
         return batch
-    
+
     dataset = make_single_dataset(
         FLAGS.config.dataset_kwargs,
         traj_transform_kwargs=FLAGS.config.traj_transform_kwargs,
         frame_transform_kwargs=FLAGS.config.frame_transform_kwargs,
         train=True,
     )
-
-  
     train_data_iter = (
         dataset.repeat()
         .unbatch()

@@ -3,9 +3,6 @@ from ml_collections.config_dict import FieldReference, placeholder
 
 from octo.utils.spec import ModuleSpec
 
-
-
-
 def get_config(config_string="full,multimodal"):
     mode, task = config_string.split(",")
     assert task in ["image_conditioned", "language_conditioned", "multimodal"]
@@ -17,24 +14,27 @@ def get_config(config_string="full,multimodal"):
     # first image key should be the third-person view (None if not used)
     # and second image key should be the wrist view (None if not used)
 
+
     FINETUNING_KWARGS = {
-        "name": "blokje_robotics",  # Name should match your TFDS dataset
-        "data_dir": "/home/myrtheiw/tensorflow_datasets",  # Top-level TFDS path
-        "image_obs_keys": {"primary": "agentview", "wrist": "eye_in_hand"},
+        # TFDS read-only dataset (version encoded in the name)
+        "name": "tomato_rlds",
+        "data_dir": "/home/myrtheiw/tfds_out",
+
+        # RLDS feature keys (as logged)
+        "image_obs_keys": {"primary": "image_primary", "wrist": "image_wrist"},
         "proprio_obs_key": "proprio",
-        "language_key": "language_instruction", 
+        "language_key": "language_instruction",
+
+        # Actions are 7-dim joint deltas; normalize all joints uniformly
         "action_proprio_normalization_type": "normal",
-        "action_normalization_mask": [True, True, True, True, True, True, False],
+        "action_normalization_mask": [True, True, True, True, True, True, True],
+
+        # standardization transform you already have
         "standardize_fn": ModuleSpec.create(
-            "octo.data.oxe.oxe_standardization_transforms:blokje_robotics_dataset_transform"
+            "octo.data.oxe.oxe_standardization_transforms:tomato_rlds_dataset_transform"
         ),
-
-        # Optional speed tuning
-        # "num_parallel_reads": 8,
-        # "num_parallel_calls": 16,
     }
-
-    # FINETUNING_KWARGS = {
+    #     FINETUNING_KWARGS = {
     #     "name": "bridge_dataset",
     #     "data_dir": "./tests/debug_dataset",
     #     "image_obs_keys": {"primary": "image_0", "wrist": None},
@@ -129,7 +129,8 @@ def get_config(config_string="full,multimodal"):
         window_size=window_size,
         action_horizon=4,
         goal_relabeling_strategy=goal_relabeling_strategy,
-        task_augment_strategy="delete_task_conditioning",
+        task_augment_strategy=None,  
+        # task_augment_strategy="delete_task_conditioning",
         task_augment_kwargs=dict(
             keep_image_prob=keep_image_prob,
         ),

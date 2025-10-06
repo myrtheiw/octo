@@ -13,7 +13,7 @@ import imageio
 def get_args():
     p = argparse.ArgumentParser(description="Replay RLDS/EnvLogger episodes from TFRecord into MuJoCo video.")
     p.add_argument("--dataset_path", type=str,
-                   default="/home/myrtheiw/tfds_out/tomato_rlds/0.0.18/tomato_rlds-train.tfrecord-00000-of-00018",
+                   default="/home/myrtheiw/tfds_out/tomato_rlds/0.0.20/tomato_rlds-train.tfrecord-00000-of-00009",
                    help="Path to TFRecord shard (uncompressed).")
     p.add_argument("--model_xml", type=str,
                    default="/home/myrtheiw/octo_ws/mujoco_playground/mujoco_playground/external_deps/mujoco_menagerie/franka_emika_panda/scene.xml",

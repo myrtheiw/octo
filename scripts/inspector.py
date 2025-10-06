@@ -1,6 +1,6 @@
 import os, tensorflow as tf, numpy as np
 
-vdir  = "/home/myrtheiw/tfds_out/tomato_rlds/0.0.7"
+vdir  = "/home/myrtheiw/tfds_out/tomato_rlds/0.0.8"
 shard = os.path.join(vdir, "tomato_rlds-train.tfrecord-00000-of-00001")
 
 def peek(ds, max_n=1):
