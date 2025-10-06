@@ -1,0 +1,16 @@
+[episode 0] WARNING: no 'action' feature_list found. Dumping contents…
+=== Episode (schema) ===
+feature_lists: <none>
+context:
+  - steps/is_first: [1, 0, 0, 0, 0, 0, 0, 0, '…']
+  - steps/is_last: [0, 0, 0, 0, 0, 0, 0, 0, '…']
+  - steps/observation/proprio: [-2.2356344509202792e-20, -0.4818606674671173, -4.655675571594758e-20, -1.5001164674758911, 6.594610838108636e-20, 1.5088146924972534, -5.418561309215114e-21, 0.0, '…']
+  - steps/action: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -4.471268966464044e-19, '…']
+  - steps/observation/gripper_open: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '…']
+  - steps/discount: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, '…']
+  - steps/is_terminal: [0, 0, 0, 0, 0, 0, 0, 0, '…']
+  - steps/observation/language_instruction: ['Pick the specified tomato by name.', 'Pick the specified tomato by name.', 'Pick the specified tomato by name.', 'Pick the specified tomato by name.', 'Pick the specified tomato by name.', 'Pick the specified tomato by name.', 'Pick the specified tomato by name.', 'Pick the specified tomato by name.', '…']
+  - steps/observation/image_primary: ['<b64:24012:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:23947:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:23960:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:23937:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:23936:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:24022:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:24038:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:24050:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '…']
+  - steps/observation/timestamp_ns: [1758710127445826455, 1758710127616648256, 1758710127627297937, 1758710127644008195, 1758710127659756787, 1758710127675568604, 1758710127692639873, 1758710127709270347, '…']
+  - steps/observation/image_wrist: ['<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '<b64:1651:/9j/4AAQSkZJRgABAQEBLAEsAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUE…>', '…']
+  - steps/reward: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '…']

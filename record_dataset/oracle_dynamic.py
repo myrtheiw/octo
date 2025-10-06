@@ -24,11 +24,23 @@ Key toggles are at the top (e.g., USE_DYNAMIC_PLANT, EPISODES_TOTAL, etc.).
 import os
 import time
 import random
+from pathlib import Path
 import numpy as np
 import mujoco
 import dm_env
 from dm_env import specs, TimeStep
-import json, re, glob, os
+import json, re, glob, os, shutil
+
+try:
+    import imageio.v2 as _imageio
+except ModuleNotFoundError:
+    _imageio = None
+    try:
+        from PIL import Image as _PILImage
+    except ModuleNotFoundError:
+        _PILImage = None
+else:
+    _PILImage = None
 
 # Rendering
 from mujoco import viewer
@@ -124,12 +136,47 @@ TYPICAL_FRANKA_LIMITS = [
 
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
-EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 200))
+EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 10))
 EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.8")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.19")
+
+_DEFAULT_GOAL_IMAGE_OUTPUT_DIR = (
+    Path(__file__).resolve().parents[1] / "outputs" / "goal_images"
+)
+GOAL_IMAGE_OUTPUT_DIR = os.environ.get(
+    "GOAL_IMAGE_OUTPUT_DIR",
+    str(_DEFAULT_GOAL_IMAGE_OUTPUT_DIR),
+)
+
+ENABLE_TFRECORD_HARVEST = bool(int(os.environ.get("ENABLE_TFRECORD_HARVEST", "0")))
+
+
+def _ensure_goal_dir_exists():
+    try:
+        os.makedirs(GOAL_IMAGE_OUTPUT_DIR, exist_ok=True)
+        return True
+    except Exception as exc:
+        print(f"[GOAL_IMG] unable to create directory '{GOAL_IMAGE_OUTPUT_DIR}': {exc}")
+        return False
+
+
+def _write_goal_image(path: str, image: np.ndarray) -> None:
+    if image is None:
+        return
+    if _imageio is not None:
+        _imageio.imwrite(path, image)
+    elif _PILImage is not None:
+        _PILImage.fromarray(image).save(path)
+    else:
+        try:
+            encoded = tf.io.encode_png(image).numpy()
+            with open(path, "wb") as f:
+                f.write(encoded)
+        except Exception as exc:
+            print(f"[GOAL_IMG] skipping save for {path}; encode failed: {exc}")
 
 # Debug
 DEBUG_IK        = True
@@ -163,14 +210,7 @@ def _post_write_repair(dataset_dir: str, dataset_name: str):
 
     _os.makedirs(dataset_dir, exist_ok=True)
 
-    # 1) Force the '-of-' suffix for single-shard files (envlogger sometimes omits it)
-    for p in list(_glob.glob(_os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-*"))):
-        b = _os.path.basename(p)
-        if b.endswith(".tfrecord-00000") and "-of-" not in b:
-            nb = b.replace(".tfrecord-00000", ".tfrecord-00000-of-00001")
-            _os.rename(p, _os.path.join(dataset_dir, nb))
-
-    # 2) Collect shards per split
+    # 1) Collect shards per split
     split_to_files = {}
     patterns = [
         _os.path.join(dataset_dir, f"{dataset_name}-*.tfrecord-*-of-*"),
@@ -190,6 +230,23 @@ def _post_write_repair(dataset_dir: str, dataset_name: str):
                 continue
             split_to_files.setdefault(split, []).append(p)
 
+    # 2) Canonicalize shard naming so TFDS can locate files deterministically
+    canonical_split_files = {}
+    for sp, files in split_to_files.items():
+        files_sorted = sorted(files)
+        n = len(files_sorted)
+        new_paths = []
+        for idx, path in enumerate(files_sorted):
+            target = _os.path.join(
+                dataset_dir,
+                f"{dataset_name}-{sp}.tfrecord-{idx:05d}-of-{n:05d}",
+            )
+            if _os.path.abspath(path) != _os.path.abspath(target):
+                _os.makedirs(_os.path.dirname(target), exist_ok=True)
+                _os.replace(path, target)
+            new_paths.append(target)
+        canonical_split_files[sp] = new_paths
+
     def _count_records(path: str) -> int:
         n = 0
         for _ in _tf.data.TFRecordDataset(path):
@@ -198,7 +255,7 @@ def _post_write_repair(dataset_dir: str, dataset_name: str):
 
     # 3) Build new split entries (INT shardLengths)
     new_splits = []
-    for sp, files in sorted(split_to_files.items()):
+    for sp, files in sorted(canonical_split_files.items()):
         files_sorted = sorted(files)
         shard_lengths = [_count_records(f) for f in files_sorted]
         num_bytes = sum(_os.path.getsize(f) for f in files_sorted)
@@ -230,11 +287,90 @@ def _post_write_repair(dataset_dir: str, dataset_name: str):
         _json.dump(info, f, indent=2)
 
 
+def _relocate_dataset_metadata(dataset_root: str, version_dir: str, dataset_version: str) -> None:
+    """Move root-level metadata files into the active version directory."""
+
+    for name in ("dataset_info.json", "features.json"):
+        src = os.path.join(dataset_root, name)
+        if not os.path.exists(src):
+            continue
+
+        meta_version = ""
+        try:
+            with open(src, "r") as fh:
+                meta = json.load(fh)
+            if isinstance(meta, dict):
+                meta_version = str(meta.get("version", ""))
+        except Exception:
+            meta_version = ""
+
+        if meta_version and meta_version != dataset_version:
+            continue
+
+        dest = os.path.join(version_dir, name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.abspath(src) == os.path.abspath(dest):
+            continue
+        try:
+            shutil.move(src, dest)
+            print(f"[TFDS] Moved metadata {name} -> {dest}")
+        except Exception as exc:
+            print(f"[TFDS] Warning: unable to move {src} -> {dest}: {exc}")
+
+
+def _ensure_min_train_split(version_dir: str, dataset_name: str) -> None:
+    """Guarantee at least one train shard exists (tiny runs can skip all train episodes).
+
+    If we only recorded validation shards (e.g., short collection where QC skipped train
+    episodes), duplicate the first available val shard into the train split so downstream
+    TFDS loaders see both splits. The copy keeps the val shard intact for evaluation.
+    """
+
+    train_pattern = os.path.join(version_dir, f"{dataset_name}-train.tfrecord-*")
+    if glob.glob(train_pattern):
+        return
+
+    val_shards = sorted(glob.glob(os.path.join(version_dir, f"{dataset_name}-val.tfrecord-*")))
+    if not val_shards:
+        return
+
+    src = val_shards[0]
+    dest = src.replace(f"{dataset_name}-val", f"{dataset_name}-train")
+
+    copy_idx = 1
+    base_dest, ext = os.path.splitext(dest)
+    while os.path.exists(dest):
+        dest = f"{base_dest}_copy{copy_idx}{ext}"
+        copy_idx += 1
+
+    shutil.copy2(src, dest)
+    print(f"[TFDS] Duplicated {os.path.basename(src)} -> {os.path.basename(dest)} to seed train split")
+
+
 def choose_split_for_episode(ep_idx: int) -> str:
-    # always put the very first one in train
-    if ep_idx == 0:
+    """Deterministically assign episodes to train/val.
+
+    For long runs we retain the historical "every Nth episode goes to val"
+    behaviour (N≈1/val_ratio). For short runs, ensure we still log at least one
+    validation shard without starving the train split.
+    """
+
+    val_ratio = float(SPLIT_RATIOS.get("val", 0.0))
+    if val_ratio <= 0.0:
         return "train"
-    return "val" if ((ep_idx + 1) % 10 == 0) else "train"
+
+    # Aim for one val episode every `val_period`.
+    val_period = max(2, int(round(1.0 / val_ratio)))  # >=2 so train keeps data
+
+    if EPISODES_TOTAL <= 1:
+        return "train"
+
+    if EPISODES_TOTAL < val_period:
+        # Short run: reserve final episode for validation, rest for train.
+        return "val" if ep_idx == (EPISODES_TOTAL - 1) else "train"
+
+    # Default stride for longer collections.
+    return "val" if ((ep_idx + 1) % val_period == 0) else "train"
 
 
 def find_gripper_actuator(model):
@@ -634,6 +770,9 @@ class PandaOracleEnv(dm_env.Environment):
         self.control_mode = str(control_mode)
         self.action_scale = float(action_scale)
         self._waypoints = None; self._T = 0; self._t = 0
+        self._last_gripper_cmd = 0.0
+        self._goal_image_primary = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+        self._goal_image_wrist = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
 
         # Renderers
         self.cam_primary = PRIMARY_CAM_NAME
@@ -641,8 +780,33 @@ class PandaOracleEnv(dm_env.Environment):
         self._r_primary = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
         self._r_wrist   = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
 
+
+    def set_language_instruction(self, text: str):
+        self.lang = str(text)
+
     def set_capture_images(self, enabled: bool):
         self._capture_images = bool(enabled)
+
+    def set_goal_images(self, primary, wrist=None):
+        if primary is None:
+            self._goal_image_primary = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+        else:
+            arr = np.asarray(primary, dtype=np.uint8)
+            if arr.shape != (IMG_H, IMG_W, 3):
+                raise ValueError(
+                    f"goal image must have shape {(IMG_H, IMG_W, 3)}, got {arr.shape}"
+                )
+            self._goal_image_primary = arr.copy()
+
+        if wrist is None:
+            self._goal_image_wrist = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+        else:
+            warr = np.asarray(wrist, dtype=np.uint8)
+            if warr.shape != (IMG_H, IMG_W, 3):
+                raise ValueError(
+                    f"goal wrist image must have shape {(IMG_H, IMG_W, 3)}, got {warr.shape}"
+                )
+            self._goal_image_wrist = warr.copy()
 
     def _render_images(self):
         if not getattr(self, "_capture_images", True):
@@ -683,6 +847,10 @@ class PandaOracleEnv(dm_env.Environment):
             self.data.qpos[self.arm_qpos_addr] = START_JOINTS
         mujoco.mj_forward(self.model, self.data)
         self._t = 0
+        if 0 <= self.gripper_idx < self.model.nu:
+            self._last_gripper_cmd = float(self.data.ctrl[self.gripper_idx])
+        else:
+            self._last_gripper_cmd = 0.0
 
         img_primary, img_wrist = self._render_images()
         return TimeStep(
@@ -694,6 +862,8 @@ class PandaOracleEnv(dm_env.Environment):
                 "language_instruction": self.lang,
                 "image_primary": img_primary,
                 "image_wrist": img_wrist,
+                "goal_image_primary": self._goal_image_primary.copy(),
+                "goal_image_wrist": self._goal_image_wrist.copy(),
             },
         )
 
@@ -718,24 +888,35 @@ class PandaOracleEnv(dm_env.Environment):
             idx = min(self._t, self._T - 1)
             q_target = self._waypoints[idx, :7]
             g_cmd    = self._waypoints[idx,  7]
+            self._last_gripper_cmd = float(g_cmd)
         else:
             # POLICY MODE: use incoming action
             if self.arm_dof_idx is None:
                 raise RuntimeError("arm_dof_idx must be provided for PD control")
-            a = np.asarray(action)
-            # Octo often outputs (T, 7) over a future horizon; take first slice.
-            if a.ndim == 2 and a.shape[-1] == 7:
+            a = np.asarray(action, dtype=np.float32)
+            # Octo often outputs (T, 8) over a future horizon; take first slice.
+            if a.ndim == 2:
                 a = a[0]
             a = a.reshape(-1)
-            if a.shape[0] != 7:
-                raise ValueError(f"Expected 7-DoF action, got shape {a.shape}")
+            if a.shape[0] < 7:
+                raise ValueError(f"Expected ≥7 DoF action, got shape {a.shape}")
+            if a.shape[0] > 7:
+                print(
+                    f"[PandaOracleEnv] action has extra dims ({a.shape[0]}); "
+                    "ignoring gripper component for now."
+                )
+                a = a[:7]
+
+            if 0 <= self.gripper_idx < self.model.nu:
+                g_cmd = float(self._last_gripper_cmd)
+            else:
+                g_cmd = 0.0
 
             q  = self.data.qpos[self.arm_qpos_addr].copy()
             # interpret as joint deltas; tune scale as needed
             q_target = q + self.action_scale * a
             q_target = self._clamp_to_limits(q_target)
-            # If you want gripper control from policy, read extra channel here; else hold current
-            g_cmd = self.data.ctrl[self.gripper_idx] if (0 <= self.gripper_idx < self.model.nu) else 0.0
+            self._last_gripper_cmd = g_cmd
 
         # Common PD inner loop
         for _ in range(self.substeps):
@@ -760,15 +941,10 @@ class PandaOracleEnv(dm_env.Environment):
                 "language_instruction": self.lang,
                 "image_primary": img_primary,
                 "image_wrist": img_wrist,
+                "goal_image_primary": self._goal_image_primary.copy(),
+                "goal_image_wrist": self._goal_image_wrist.copy(),
             },
         )
-
-    def _render_images(self):
-        self._r_primary.update_scene(self.data, camera=self.cam_primary)
-        img_primary = self._r_primary.render().copy()
-        self._r_wrist.update_scene(self.data, camera=self.cam_wrist)
-        img_wrist = self._r_wrist.render().copy()
-        return img_primary, img_wrist
 
     def observation_spec(self):
         return {
@@ -776,17 +952,54 @@ class PandaOracleEnv(dm_env.Environment):
             "language_instruction": specs.Array(shape=(), dtype=object, name="language_instruction"),
             "image_primary": specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="image_primary"),
             "image_wrist":   specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="image_wrist"),
+            "goal_image_primary": specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="goal_image_primary"),
+            "goal_image_wrist":   specs.Array(shape=(IMG_H, IMG_W, 3), dtype=np.uint8, name="goal_image_wrist"),
         }
 
     def action_spec(self):
-        return specs.Array(shape=(7,), dtype=np.float32, name="action")  # unused but defined for RLDS
+        return specs.Array(shape=(7,), dtype=np.float32, name="action")
 
 # ------------------------------ Rollout & Logging -----------------------------
+
+def _infer_goal_frame_idx(waypoints: np.ndarray) -> int:
+    if waypoints is None or len(waypoints) == 0:
+        return 0
+    grip = waypoints[:, 7]
+    closed = np.where(grip <= 0.05)[0]
+    if closed.size == 0:
+        return len(waypoints) - 1
+    return int(closed[0])
+
+
+def _render_goal_images_at_idx(
+    base_env: "PandaOracleEnv",
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    arm_qpos_addr: np.ndarray,
+    waypoints: np.ndarray,
+    goal_idx: int,
+):
+    if waypoints is None or len(waypoints) == 0:
+        return None, None
+    goal_idx = int(np.clip(goal_idx, 0, len(waypoints) - 1))
+    q_backup = data.qpos.copy()
+    try:
+        data.qpos[arm_qpos_addr] = waypoints[goal_idx, :7]
+        mujoco.mj_forward(model, data)
+        base_env._r_primary.update_scene(data, camera=base_env.cam_primary)
+        primary = base_env._r_primary.render().copy()
+        base_env._r_wrist.update_scene(data, camera=base_env.cam_wrist)
+        wrist = base_env._r_wrist.render().copy()
+    finally:
+        data.qpos[:] = q_backup
+        mujoco.mj_forward(model, data)
+    return primary, wrist
+
 
 def run_oracle_once(
     env, base_env, model, data, arm_dof_idx, arm_qpos_addr, ee_ref,
     goal_pos, obstacles=None, goal_body_name=None,
-    waypoints=None, dry_run=False,
+    waypoints=None, dry_run=False, goal_frame_idx=None,
 ):
     """
     Plan to goal_pos, build waypoints (7 joints + gripper), then either:
@@ -921,6 +1134,9 @@ def run_oracle_once(
         grip[end_ramp:] = GRIP_CLOSE
 
         waypoints = np.concatenate([traj_q_hold, grip[:, None]], axis=1).astype(np.float32)
+        goal_frame_idx = int(max(0, min(end_ramp - 1, len(waypoints) - 1)))
+    elif goal_frame_idx is None:
+        goal_frame_idx = _infer_goal_frame_idx(waypoints)
 
     # ---- DRY RUN: execute without logging
     if dry_run:
@@ -979,7 +1195,7 @@ def run_oracle_once(
         except Exception:
             pass
         print(f"[QC] final |EE - goal| = {err_final:.4f} m")
-        return err_final, waypoints
+        return err_final, waypoints, int(goal_frame_idx)
 
     # ---- LOGGED RUN ----
     if env is None:
@@ -1026,7 +1242,7 @@ def run_oracle_once(
     ee_pos, _ = _ee_pose(model, data, ee_ref)
     err_final = float(np.linalg.norm(goal_pos - ee_pos))
     print(f"[RUN] final |EE - goal| = {err_final:.4f} m")
-    return err_final, waypoints
+    return err_final, waypoints, int(goal_frame_idx)
 
 
 # ----------------------------------- Main -------------------------------------
@@ -1080,6 +1296,8 @@ def main():
                     "language_instruction": tfds.features.Text(),
                     "image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
                     "image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
+                    "goal_image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
+                    "goal_image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
                 }),
                 action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),
                 reward_info=tf.float32,
@@ -1098,6 +1316,14 @@ def main():
             for name, grasp_pos, approach_xy, truss_name in top:
                 print(f"[Target(stem@0.66)] {name}  grasp={grasp_pos}  (Z={grasp_pos[2]:.3f})")
 
+            if top:
+                ordered = sorted(((name, float(np.linalg.norm(grasp[:2]))) for name, grasp, *_ in top), key=lambda t: t[1])
+                mid_idx = max(1, len(ordered) // 2)
+                front_targets = {name for name, _ in ordered[:mid_idx]}
+                back_targets = {name for name, _ in ordered[mid_idx:]}
+            else:
+                front_targets, back_targets = set(), set()
+
             episodes_here = min(EPISODES_PER_PLANT, EPISODES_TOTAL - episodes_done)
 
             # --------- Episode loop ---------
@@ -1107,12 +1333,21 @@ def main():
                     name, goal_pos, approach_xy, truss_name = top[epi % len(top)]
                     obstacles = obstacles_all
 
+                    if name in front_targets or not back_targets:
+                        language_text = "Pick the top tomato in front."
+                    else:
+                        language_text = "Pick the top tomato in the back."
+                    base_env.set_language_instruction(language_text)
+
                     # Deterministic split per episode count
                     split_name = choose_split_for_episode(episodes_done)
                     print(f"[EP] {episodes_done} → split={split_name}  target={name}")
 
+                    # Clear any stale goal image from prior episode
+                    base_env.set_goal_images(None, None)
+
                     # ---- QC DRY RUN ----
-                    err_final, waypoints = run_oracle_once(
+                    err_final, waypoints, goal_frame_idx = run_oracle_once(
                         env=None, base_env=base_env, model=model, data=data,
                         arm_dof_idx=arm_dof_idx, arm_qpos_addr=arm_qpos_addr, ee_ref=ee_ref,
                         goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
@@ -1122,8 +1357,31 @@ def main():
                         print(f"[QC] ❌ Skip episode (err={err_final:.3f} > {MAX_FINAL_ERR})")
                         continue
 
+                    goal_primary, goal_wrist = _render_goal_images_at_idx(
+                        base_env=base_env,
+                        model=model,
+                        data=data,
+                        arm_qpos_addr=arm_qpos_addr,
+                        waypoints=waypoints,
+                        goal_idx=goal_frame_idx,
+                    )
+                    base_env.set_goal_images(goal_primary, goal_wrist)
+
+                    if goal_primary is not None and _ensure_goal_dir_exists():
+                        stem_safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+                        fname = f"ep{episodes_done:05d}_{split_name}_{stem_safe}.png"
+                        goal_path = os.path.join(GOAL_IMAGE_OUTPUT_DIR, fname)
+                        try:
+                            _write_goal_image(goal_path, goal_primary)
+                            if goal_wrist is not None:
+                                wrist_name = f"ep{episodes_done:05d}_{split_name}_{stem_safe}_wrist.png"
+                                wrist_path = os.path.join(GOAL_IMAGE_OUTPUT_DIR, wrist_name)
+                                _write_goal_image(wrist_path, goal_wrist)
+                        except Exception as exc:
+                            print(f"[GOAL_IMG] failed to save goal images: {exc}")
+
                     # ---- LOG THE EPISODE ----
-                    dataset_root = TFDS_ROOT_DIR                                   # write to ROOT
+                    dataset_root = TFDS_ROOT_DIR
                     version_dir  = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
                     os.makedirs(dataset_root, exist_ok=True)
                     os.makedirs(version_dir,  exist_ok=True)
@@ -1142,18 +1400,20 @@ def main():
                             env=env, base_env=base_env, model=model, data=data,
                             arm_dof_idx=arm_dof_idx, arm_qpos_addr=arm_qpos_addr, ee_ref=ee_ref,
                             goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
-                            waypoints=waypoints, dry_run=False,
+                            waypoints=waypoints, dry_run=False, goal_frame_idx=goal_frame_idx,
                         )
 
                     episodes_done += 1
                     print(f"[PROGRESS] ✅ Episodes saved: {episodes_done}/{EPISODES_TOTAL}")
 
                     # Sweep any shards the writer dropped anywhere into the version dir, then repair splits
-                    harvest_any_tfrecords(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
-                    # Ensure dataset_info.json exists (first-episode edge case)
-                    info_p = os.path.join(version_dir, "dataset_info.json")
-                    if not os.path.exists(info_p):
-                        _post_write_repair(version_dir, DATASET_NAME)
+                    move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)
+                    if ENABLE_TFRECORD_HARVEST:
+                        harvest_any_tfrecords(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
+                    # Repair shard naming / dataset_info.json after each write
+                    _post_write_repair(version_dir, DATASET_NAME)
+                    _relocate_dataset_metadata(TFDS_ROOT_DIR, version_dir, DATASET_VERSION)
+                    _ensure_min_train_split(version_dir, DATASET_NAME)
                     repair_tfds_splits(version_dir, DATASET_NAME)
                 except Exception as e:
                     print(f"[ERROR] Episode failed on plant {plant_idx}, epi {epi}: {e}")
@@ -1165,11 +1425,13 @@ def main():
     # ---- Summary ----
     version_dir = os.path.join(TFDS_ROOT_DIR, DATASET_NAME, DATASET_VERSION)
     # safety sweep for all splits
-    for split_name in ("train", "val", "test"):
-        harvest_any_tfrecords(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
-    info_p = os.path.join(version_dir, "dataset_info.json")
-    if not os.path.exists(info_p):
-        _post_write_repair(version_dir, DATASET_NAME)
+    move_stray_shards_into_version_dir(TFDS_ROOT_DIR, ds_config)
+    if ENABLE_TFRECORD_HARVEST:
+        for split_name in ("train", "val", "test"):
+            harvest_any_tfrecords(TFDS_ROOT_DIR, version_dir, DATASET_NAME, split_name)
+    _post_write_repair(version_dir, DATASET_NAME)
+    _relocate_dataset_metadata(TFDS_ROOT_DIR, version_dir, DATASET_VERSION)
+    _ensure_min_train_split(version_dir, DATASET_NAME)
     repair_tfds_splits(version_dir, DATASET_NAME)
 
     print(f"✅ RLDS/TFDS episodes are under: {version_dir}")

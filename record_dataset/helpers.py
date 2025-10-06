@@ -48,14 +48,11 @@ def move_stray_shards_into_version_dir(root_dir, ds_config):
     expected = expected_ds_dir(root_dir, ds_config)
     os.makedirs(expected, exist_ok=True)
 
-    # Pick up shards even if EnvLogger created nested subdirs
-    pattern = os.path.join(root_dir, "**", f"{ds_config.name}-*.tfrecord-*")
-    stray = sorted(glob.glob(pattern, recursive=True))
+    # Envlogger writes shards directly under `data_directory`; only scoop those.
+    pattern = os.path.join(root_dir, f"{ds_config.name}-*.tfrecord-*")
+    stray = sorted(glob.glob(pattern, recursive=False))
     moved = 0
     for src in stray:
-        # Skip ones already in the expected dir
-        if os.path.commonpath([os.path.abspath(src), os.path.abspath(expected)]) == os.path.abspath(expected):
-            continue
         dest = os.path.join(expected, os.path.basename(src))
         try:
             shutil.move(src, dest)
@@ -373,36 +370,57 @@ def find_side_stem_targets(model, data, k=2, s=0.66):
     return ordered[:k]
 
 def harvest_any_tfrecords(root_dir: str, version_dir: str, ds_name: str, split_name: str) -> int:
-    """Recursively find any *.tfrecord* under root_dir and move/rename them to:
+    """Recursively find *.tfrecord* under root_dir and move/rename them into:
        {version_dir}/{ds_name}-{split_name}.tfrecord-<suffix>.
-       Returns number of files moved."""
+       Returns the number of files moved."""
     import glob, os, shutil
+
     os.makedirs(version_dir, exist_ok=True)
     moved = 0
-    for src in sorted(glob.glob(os.path.join(root_dir, "**", "*.tfrecord*"), recursive=True)):
-        # skip already-in-place files
-        if os.path.commonpath([os.path.abspath(src), os.path.abspath(version_dir)]) == os.path.abspath(version_dir):
-            continue
+
+    # Accept both .tfrecord and .tfrecord-<shard> names
+    cand_patterns = ["**/*.tfrecord", "**/*.tfrecord-*"]
+    candidates = []
+    for pat in cand_patterns:
+        candidates.extend(glob.glob(os.path.join(root_dir, pat), recursive=True))
+
+    # Dedup and sort for stability
+    seen = set()
+    for src in sorted(set(candidates)):
+        src_abs = os.path.abspath(src)
+        # skip anything already inside the version_dir
+        try:
+            if os.path.commonpath([src_abs, os.path.abspath(version_dir)]) == os.path.abspath(version_dir):
+                continue
+        except Exception:
+            # If commonpath fails on different drives, ignore and continue
+            pass
+
         base = os.path.basename(src)
         # keep shard suffix if present, else synthesize one
         if ".tfrecord-" in base:
             suffix = base.split(".tfrecord-", 1)[1]
         else:
+            # Envlogger sometimes writes plain ".tfrecord" → normalize to a single shard
             suffix = "00000-of-00001"
+
         dest = os.path.join(version_dir, f"{ds_name}-{split_name}.tfrecord-{suffix}")
-        if os.path.exists(dest):
-            i = 1
-            while True:
-                alt = os.path.join(version_dir, f"{ds_name}-{split_name}.tfrecord-{i:05d}-of-00100")
-                if not os.path.exists(alt):
-                    dest = alt
-                    break
-                i += 1
+        # If collision, synthesize sequential shard ids (kept consistent width)
+        i = 0
+        while os.path.exists(dest):
+            i += 1
+            dest = os.path.join(version_dir, f"{ds_name}-{split_name}.tfrecord-{i:05d}-of-00100")
+
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.move(src, dest)
         moved += 1
+
     if moved:
         print(f"[TFDS] Harvested {moved} shard(s) into {version_dir}")
     return moved
+
+
+
 
 def repair_tfds_splits(version_dir, name):
     return repair_tfds_splits_at_dir(version_dir, name)
@@ -427,6 +445,7 @@ _move_stray_shards_into_version_dir = move_stray_shards_into_version_dir
 _repair_tfds_splits_at_dir = repair_tfds_splits_at_dir
 _harvest_any_tfrecords = harvest_any_tfrecords
 _repair_tfds_splits = repair_tfds_splits
+
 # ------------------------------- Self-test ------------------------------------
 
 def approx_body_radius_max(model, body_id, pad=0.01, default=0.03):
