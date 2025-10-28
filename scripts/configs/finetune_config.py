@@ -178,6 +178,14 @@ def get_config(config_string="full,multimodal"):
         "frame_transform_threads"
     ] = 16  # for the most CPU-intensive ops (decoding, resizing, augmenting)
 
+    # [TINY-OVERFIT] Expose debug toggles consumed by tools/tiny_overfit.py.
+    config["tiny_overfit_overrides"] = dict(
+        disable_augmentations=False,
+        dropout_override=None,
+        deterministic_shuffle=False,
+        override_frozen_keys=None,
+    )
+
     config["traj_transform_kwargs"] = traj_transform_kwargs
     config["frame_transform_kwargs"] = frame_transform_kwargs
     return ConfigDict(config)

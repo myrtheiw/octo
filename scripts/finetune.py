@@ -1,7 +1,7 @@
 import datetime
 from functools import partial
 import os
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Disable CUDA to prevent TensorFlow from using GPU memory
 from absl import app, flags, logging
 import flax
 from flax.traverse_util import flatten_dict
@@ -395,7 +395,7 @@ def main(_):
                 wandb_log(val_metrics, step=i)
 
             with timer("visualize"):
-                viz_metrics = viz_callback(train_state, i + 1)
+                viz_metrics = viz_calplback(train_state, i + 1)
                 wandb_log(viz_metrics, step=i)
 
             if rollout_callback is not None:

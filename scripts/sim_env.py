@@ -120,7 +120,8 @@ class PandaSimEnv(dm_env.Environment):
     def __init__(self, model, data, arm_act_ids, arm_qpos_addr, ee_ref,
                  substeps=40, gripper_idx=-1, arm_dof_idx=None,
                  kp=120.0, kd=None, action_scale=0.05,
-                 primary_cam=None, wrist_cam=None, arm_gain_type=None): 
+                 primary_cam=None, wrist_cam=None, arm_gain_type=None,
+                 capture_images=True):
         self.model = model; self.data = data
         self.arm_act_ids = np.asarray(arm_act_ids, int)
         self.arm_qpos_addr = np.asarray(arm_qpos_addr, int)
@@ -134,12 +135,20 @@ class PandaSimEnv(dm_env.Environment):
         self.kd = float(2.0 * np.sqrt(self.kp) if kd is None else kd)
         self.action_scale = float(action_scale)
         self._t = 0
-        self._capture_images = True
+        self._capture_images = bool(capture_images)
+        self._last_q_target = None
+        self._last_raw_action = None
+        self._last_q_target_nominal = np.zeros(7, dtype=np.float32)
+        self._last_joint_clamped = np.zeros(7, dtype=bool)
+        self._last_ctrl_cmd = np.zeros(7, dtype=np.float32)
 
         self.cam_primary = primary_cam or resolve_camera_name(model, PRIMARY_CAM_CANDIDATES, fallback_id=0)
         self.cam_wrist   = wrist_cam   or resolve_camera_name(model, WRIST_CAM_CANDIDATES,   fallback_id=min(1, max(0, int(getattr(model, "ncam", 1)) - 1)))
-        self._r_primary = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
-        self._r_wrist   = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
+        self._r_primary = None
+        self._r_wrist = None
+        if self._capture_images:
+            self._r_primary = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
+            self._r_wrist = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
 
         # --- NEW: actuator mode detection ---
         self.arm_gain_type = np.asarray(arm_gain_type if arm_gain_type is not None else [], int)
@@ -150,17 +159,23 @@ class PandaSimEnv(dm_env.Environment):
 
     def set_capture_images(self, enabled: bool):
         self._capture_images = bool(enabled)
+        if not self._capture_images:
+            return
+        if self._r_primary is None:
+            self._r_primary = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
+        if self._r_wrist is None:
+            self._r_wrist = mujoco.Renderer(self.model, height=IMG_H, width=IMG_W)
 
     def _render_images(self):
         if not getattr(self, "_capture_images", True):
             z = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
             return z, z
-        if self.cam_primary:
+        if self._r_primary is not None and self.cam_primary:
             self._r_primary.update_scene(self.data, camera=self.cam_primary)
             img_primary = self._r_primary.render().copy()
         else:
             img_primary = np.zeros((IMG_H, IMG_W, 3), np.uint8)
-        if self.cam_wrist:
+        if self._r_wrist is not None and self.cam_wrist:
             self._r_wrist.update_scene(self.data, camera=self.cam_wrist)
             img_wrist = self._r_wrist.render().copy()
         else:
@@ -185,6 +200,10 @@ class PandaSimEnv(dm_env.Environment):
             self.data.ctrl[self.arm_act_ids] = self.data.qpos[self.arm_qpos_addr]   # <--- ADD
         mujoco.mj_forward(self.model, self.data)
         self._t = 0
+        self._last_q_target = self.data.qpos[self.arm_qpos_addr].copy()
+        self._last_q_target_nominal = self._last_q_target.copy()
+        self._last_joint_clamped[:] = False
+        self._last_ctrl_cmd[:] = 0.0
         img_primary, img_wrist = self._render_images()
         return TimeStep(
             dm_env.StepType.FIRST,
@@ -205,7 +224,14 @@ class PandaSimEnv(dm_env.Environment):
         if a.shape != (7,):
             raise ValueError(f"Expected action shape (7,), got {a.shape}")
         q  = self.data.qpos[self.arm_qpos_addr].copy()
-        q_target = self._clamp_to_limits(q + self.action_scale * a)
+        q_nominal = q + self.action_scale * a
+        q_target = self._clamp_to_limits(q_nominal)
+        self._last_raw_action = a.copy()
+        self._last_q_target = q_target.copy()
+        self._last_q_target_nominal = q_nominal.copy()
+        self._last_joint_clamped = np.abs(q_target - q_nominal) > 1e-6
+        last_ctrl = np.zeros(self.arm_act_ids.shape[0], dtype=np.float32)
+        # note: VECTOR_DIM not defined; adjust to len arm_act_ids
 
         if self._all_position_act:
             # Position actuators: set target directly (outer loop is delta-q)

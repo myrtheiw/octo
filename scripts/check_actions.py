@@ -31,6 +31,7 @@ from tensorflow_datasets.core.file_adapters import FileFormat
 import os
 import glob
 import json
+from collections.abc import Mapping
 from typing import Iterable, Dict, Any
 
 def _np(x):
@@ -55,25 +56,117 @@ def _first_present(d, keys):
 
 def _episode_to_numpy(ep):
     """Convert a TFDS RLDS episode to a plain numpy dict of sequences."""
-    # Common RLDS structure: ep = {'steps': { 'observation': {...}, 'action': ..., 'is_terminal': ...}, 'episode_metadata': ...}
-    # Sometimes it's already flattened (no 'steps'); handle both.
-    d = {}
-    for k, v in ep.items():
-        if isinstance(v, dict):
-            d[k] = {kk: _np(vv) for kk, vv in v.items()}
-        else:
-            d[k] = _np(v)
-    return d
+    if isinstance(ep, dict):
+        return {k: _episode_to_numpy(v) for k, v in ep.items()}
+    if isinstance(ep, (list, tuple)):
+        return type(ep)(_episode_to_numpy(v) for v in ep)
+    return _np(ep)
+
+
+def _stack_sequence(items):
+    """Stack a list of homogeneous items (possibly nested dicts) into arrays."""
+    if not items:
+        return []
+
+    first = items[0]
+    if isinstance(first, Mapping):
+        out = {}
+        for k in first:
+            out[k] = _stack_sequence([item[k] for item in items])
+        return out
+
+    if isinstance(first, (list, tuple)):
+        stacked = [_materialize_steps(v) for v in items]
+        return _stack_sequence(stacked)
+
+    arr_items = []
+    for item in items:
+        if hasattr(item, "numpy"):
+            item = item.numpy()
+        arr_items.append(np.asarray(item))
+
+    try:
+        return np.stack(arr_items, axis=0)
+    except Exception:
+        return np.asarray(arr_items)
+
+
+def _materialize_steps(steps):
+    """Materialize TFDS/TF datasets or nested sequences into numpy arrays."""
+    if isinstance(steps, Mapping):
+        return {k: _materialize_steps(v) for k, v in steps.items()}
+
+    if hasattr(steps, "numpy"):
+        return steps.numpy()
+
+    if isinstance(steps, np.ndarray):
+        if steps.dtype == object:
+            return _materialize_steps(list(steps))
+        return steps
+
+    if isinstance(steps, (list, tuple)):
+        items = [_materialize_steps(v) for v in steps]
+        return _stack_sequence(items)
+
+    if isinstance(steps, (str, bytes)):
+        return steps
+
+    if hasattr(steps, "as_numpy_iterator"):
+        items = [_materialize_steps(v) for v in steps.as_numpy_iterator()]
+        return _stack_sequence(items)
+
+    try:
+        iterator = iter(steps)
+    except TypeError:
+        return steps
+    else:
+        items = [_materialize_steps(v) for v in iterator]
+        return _stack_sequence(items)
 
 
 def _extract_steps(ep_dict, print_keys=False):
     """Return (proprio[T, nq], actions[T,7]) arrays from a numpyfied episode dict."""
-    # Try to find the 'steps' dict
-    steps = ep_dict.get("steps", None)
-    if steps is None:
-        # some builders expose flattened keys at top level; collect them
-        # Heuristics: collect entries whose first dim matches others
-        steps = {k: v for k, v in ep_dict.items() if isinstance(v, np.ndarray)}
+
+    def _insert_nested(root: dict, key: str, value):
+        parts = [p for p in key.split("/") if p]
+        cur = root
+        for part in parts[:-1]:
+            cur = cur.setdefault(part, {})
+        cur[parts[-1]] = value
+
+    steps = ep_dict.get("steps")
+    if isinstance(steps, np.ndarray) and steps.dtype == object and steps.size == 1:
+        try:
+            steps = steps.item()
+        except Exception:
+            pass
+    if isinstance(steps, (list, tuple)) and steps and isinstance(steps[0], dict):
+        # some decoders wrap steps in a list of dicts
+        steps = steps[0]
+
+    # Start with any directly materializable structure
+    nested = {}
+    materialized = None
+    if steps is not None:
+        if isinstance(steps, Mapping) and steps:
+            materialized = steps
+        else:
+            materialized = _materialize_steps(steps)
+
+    if isinstance(materialized, Mapping) and materialized:
+        nested = materialized
+    else:
+        for key, val in ep_dict.items():
+            if isinstance(val, np.ndarray) and key.startswith("steps/"):
+                _insert_nested(nested, key[len("steps/"):], val)
+
+    if not nested:
+        # Fallback: collect any array-like entries for debugging
+        for k, v in ep_dict.items():
+            if isinstance(v, np.ndarray):
+                nested[k] = v
+
+    steps = _materialize_steps(nested)
 
     if print_keys:
         def _list_keys(prefix, obj):
@@ -83,7 +176,7 @@ def _extract_steps(ep_dict, print_keys=False):
             else:
                 print(prefix[:-1], obj.shape, obj.dtype)
         print("=== Available step keys & shapes ===")
-        _list_keys("", steps)
+        _list_keys("", nested)
 
     # Candidate keys for proprio and action
     proprio_keys = [
@@ -91,16 +184,33 @@ def _extract_steps(ep_dict, print_keys=False):
         "proprio",
         "observation/qpos",
         "qpos",
+        "steps/observation/proprio",
+        "steps/proprio",
     ]
     action_keys = [
         "action",
         "actions",
         "policy/action",
         "observation/action",  # uncommon, but check
+        "steps/action",
     ]
 
     pk, proprio = _first_present(steps, proprio_keys)
     ak, actions = _first_present(steps, action_keys)
+
+    if proprio is None:
+        for key in proprio_keys:
+            if key in ep_dict:
+                proprio = _np(ep_dict[key])
+                pk = key
+                break
+    if actions is None:
+        for key in action_keys:
+            if key in ep_dict:
+                actions = _np(ep_dict[key])
+                ak = key
+                break
+
     if proprio is None or actions is None:
         raise KeyError(
             f"Could not find proprio/actions in episode. "
@@ -109,7 +219,18 @@ def _extract_steps(ep_dict, print_keys=False):
         )
 
     proprio = _np(proprio)
+    if isinstance(proprio, np.ndarray) and proprio.dtype == object:
+        try:
+            proprio = np.stack([_np(p) for p in proprio], axis=0)
+        except Exception as exc:
+            raise ValueError(f"Failed to stack proprio object array (key='{pk}'): {exc}") from exc
+
     actions = _np(actions)
+    if isinstance(actions, np.ndarray) and actions.dtype == object:
+        try:
+            actions = np.stack([_np(a) for a in actions], axis=0)
+        except Exception as exc:
+            raise ValueError(f"Failed to stack action object array (key='{ak}'): {exc}") from exc
     if proprio.ndim != 2:
         raise ValueError(f"Expected proprio to be rank-2 [T, nq], got shape {proprio.shape} (key='{pk}')")
     if actions.ndim == 1:
@@ -170,7 +291,9 @@ def main():
             ds = builder.as_dataset(split=args.split)
             use_tfds = True
 
-    if not use_tfds:
+    if use_tfds:
+        iter_source = ("tfds", ds)
+    else:
         # === RAW TFRecord fallback: parse Example float_list/int64_list ===
         pat = os.path.join(version_dir, f"{ds_name}-{args.split}.tfrecord-*")
         shards = sorted(glob.glob(pat))
