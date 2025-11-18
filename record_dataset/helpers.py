@@ -26,10 +26,14 @@ Then import in your IK code, e.g.:
 
 from __future__ import annotations
 import numpy as np
+
 import mujoco
 import os
 import sys
 sys.path.insert(1, '/home/myrtheiw/octo_ws/octo')
+
+from typing import Optional
+
 from record_dataset.generate_tomato_plant import generate_tomato_plant_xml
 from record_dataset.getlocation import get_side_stem_origins_and_quats
 from record_dataset.getlocation import get_side_stem_grasp_points
@@ -38,6 +42,28 @@ from record_dataset.getlocation import get_side_stem_grasp_points
 SPLIT_RATIOS = dict(train=0.90, val=0.10, test=0.0)
 # ------------------------------- Helpers --------------------------------------
 import json, re, glob, os, shutil
+
+
+def _ensure_worldbody_camera(scene_text: str, cam_xml: str) -> str:
+    """Insert a camera XML snippet just after <worldbody> if it's missing."""
+    # If worldbody doesn't exist, just return unchanged (very unusual for MuJoCo scenes).
+    if "<worldbody" not in scene_text:
+        return scene_text
+    # Insert right after the opening <worldbody ...>
+    return re.sub(r"(<worldbody[^>]*>)", r"\1\n    " + cam_xml.strip() + "\n", scene_text, count=1)
+
+def _ensure_front_cam(scene_text: str) -> str:
+    """Make sure a <camera name='front_cam' .../> exists."""
+    if re.search(r'<camera\s+name\s*=\s*"front_cam"\b', scene_text):
+        return scene_text  # already present
+    # Reasonable default that matches your scene.xml (pos/axes/fovy).
+    front_cam_xml = """
+    <camera name="front_cam"
+            pos="0.65 -1.0 1.60"
+            xyaxes="0.988936 0.148340 -0.000000   -0.113436 0.756243 0.644382"
+            fovy="57"/>
+    """.strip()
+    return _ensure_worldbody_camera(scene_text, front_cam_xml)
 
 def expected_ds_dir(root_dir, ds_config):
     return os.path.join(root_dir, ds_config.name, str(ds_config.version))
@@ -239,6 +265,21 @@ def approach_normal_lateral(model, data, goal_pos, plant_body="tomato_plant"):
         return np.array([1.0, 0.0, 0.0], dtype=float)  # fallback
     return n / n_norm
 
+
+def compute_joint_delta_action(
+    q_now,
+    q_target,
+    include_gripper: Optional[float] = None,
+) -> np.ndarray:
+    """Return the joint delta needed to reach q_target from q_now."""
+    q_now_arr = np.asarray(q_now, dtype=np.float32)
+    q_next_arr = np.asarray(q_target, dtype=np.float32)
+    delta = (q_next_arr[:7] - q_now_arr[:7]).astype(np.float32, copy=False)
+    if include_gripper is None:
+        return delta
+    grip = np.array([float(include_gripper)], dtype=np.float32)
+    return np.concatenate([delta, grip], axis=0)
+
 EPISODES_TOTAL = 100
 EPISODES_PER_PLANT = 2  # grasp top two, then regenerate
 
@@ -280,9 +321,84 @@ def scene_dir_from_model_path(model_path: str) -> str:
     base = os.path.dirname(model_path) if model_path else ""
     return base if os.path.isdir(base) else os.getcwd()
 
-def write_scene_dynamic(scene_path: str):
-    """Write a scene xml that includes panda.xml + tomato_plant.xml and
-    preserves floor/camera/visual/asset from your original scene."""
+# --- add near the top of helpers.py ---
+import re
+import os
+import mujoco
+from typing import Optional
+
+def _swap_plant_include(scene_text: str, new_include: str = "tomato_plant.xml") -> str:
+    """
+    Replace any tomato-plant include line with `tomato_plant.xml`.
+    Handles tomato_plant_v10.xml or older names. If none found, we insert
+    right after the panda include.
+    """
+    # 1) Try to replace any tomato_plant*.xml include
+    pat = r'<include\s+file\s*=\s*"tomato_plant[^"]*\.xml"\s*/?>'
+    if re.search(pat, scene_text):
+        return re.sub(pat, f'<include file="{new_include}"/>', scene_text, count=99)
+
+    # 2) Otherwise, insert after panda include (best-effort)
+    panda_pat = r'(<include\s+file\s*=\s*"panda\.xml"\s*/?>)'
+    if re.search(panda_pat, scene_text):
+        return re.sub(panda_pat,
+                      r'\1\n  <include file="{}"/>'.format(new_include),
+                      scene_text, count=1)
+    # 3) Fallback: just prepend one at top-level after <mujoco ...>
+    head_pat = r'(<mujoco[^>]*>)'
+    if re.search(head_pat, scene_text):
+        return re.sub(head_pat,
+                      r'\1\n  <include file="{}"/>'.format(new_include),
+                      scene_text, count=1)
+    return scene_text  # last resort, unchanged
+
+
+def _dedupe_named_tags(scene_text: str, tag: str, name: str) -> str:
+    """
+    Keep only the first <tag name="name" ...> ... </tag> (or self-closing) block.
+    Removes subsequent duplicates to avoid MuJoCo 'repeated name' errors.
+    """
+    # Matches both self-closing <camera .../> and block <camera ...>...</camera>
+    pat = re.compile(
+        rf'<{tag}\s+[^>]*name\s*=\s*"{re.escape(name)}"[^>]*\/>|'
+        rf'<{tag}\s+[^>]*name\s*=\s*"{re.escape(name)}"[^>]*>.*?<\/{tag}>',
+        flags=re.DOTALL | re.IGNORECASE
+    )
+    matches = list(pat.finditer(scene_text))
+    if len(matches) <= 1:
+        return scene_text  # nothing to do
+    # Keep the first, remove the rest
+    keep_start, keep_end = matches[0].span()
+    pieces = [scene_text[:keep_end]]
+    last = keep_end
+    for m in matches[1:]:
+        s, e = m.span()
+        pieces.append(scene_text[last:s])  # skip the duplicate block
+        last = e
+    pieces.append(scene_text[last:])
+    return "".join(pieces)
+
+
+def write_scene_dynamic(scene_path: str,
+                        template_scene_path: Optional[str] = None):
+    if template_scene_path and os.path.isfile(template_scene_path):
+        with open(template_scene_path, "r") as f:
+            txt = f.read()
+        # swap tomato include so dynamic plant comes from tomato_plant.xml
+        txt2 = _swap_plant_include(txt, "tomato_plant.xml")
+
+        # NEW: ensure we don’t duplicate cameras that may also be defined in included files
+        txt2 = _dedupe_named_tags(txt2, tag="camera", name="front_cam")
+        txt2 = _dedupe_named_tags(txt2, tag="camera", name="third_person_cam")
+
+        with open(scene_path, "w") as f:
+            f.write(txt2)
+        print(f"[scene] wrote dynamic scene from template: {template_scene_path}")
+        return
+
+    # (fallback scene text unchanged)
+
+    # ---- minimal fallback (old behavior) ----
     scene_txt = """<mujoco model="panda scene">
   <include file="panda.xml"/>
   <include file="tomato_plant.xml"/>
@@ -308,49 +424,34 @@ def write_scene_dynamic(scene_path: str):
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
     <camera name="third_person_cam" pos="0.25 -1.5 2" euler="50 0 0"/>
-
-    <!-- ===== DEBUG VIZ (mocap bodies you can pose from Python) ===== -->
-    <body name="goal_viz" mocap="true">
-      <!-- axis frame (x:red, y:green, z:blue) -->
-      <geom type="capsule" fromto="0 0 0 0.06 0 0" size="0.003" rgba="1 0 0 1"/>
-      <geom type="capsule" fromto="0 0 0 0 0.06 0" size="0.003" rgba="0 1 0 1"/>
-      <geom type="capsule" fromto="0 0 0 0 0 0.06" size="0.003" rgba="0 0 1 1"/>
-      <site name="goal_site" size="0.01" rgba="1 0 0 0.25"/>
-    </body>
-
-    <body name="pregrasp_viz" mocap="true">
-      <geom type="capsule" fromto="0 0 0 0.05 0 0" size="0.0025" rgba="1 0.4 0.4 1"/>
-      <geom type="capsule" fromto="0 0 0 0 0.05 0" size="0.0025" rgba="0.4 1 0.4 1"/>
-      <geom type="capsule" fromto="0 0 0 0 0 0.05" size="0.0025" rgba="0.4 0.4 1 1"/>
-      <site name="pregrasp_site" size="0.01" rgba="1 0.4 0.4 0.25"/>
-    </body>
-
-    <body name="retreat_viz" mocap="true">
-      <geom type="capsule" fromto="0 0 0 0.04 0 0" size="0.0025" rgba="0.8 0.5 0.1 1"/>
-      <geom type="capsule" fromto="0 0 0 0 0.04 0" size="0.0025" rgba="0.5 0.8 0.1 1"/>
-      <geom type="capsule" fromto="0 0 0 0 0 0.04" size="0.0025" rgba="0.1 0.5 0.8 1"/>
-      <site name="retreat_site" size="0.01" rgba="0.8 0.5 0.1 0.25"/>
-    </body>
-    <!-- ============================================================= -->
   </worldbody>
-
 </mujoco>"""
+    # ensure front_cam for the fallback file too
+    scene_txt = _ensure_front_cam(scene_txt)
     with open(scene_path, "w") as f:
         f.write(scene_txt)
+    print("[scene] wrote minimal dynamic scene (fallback).")
+
+
+_REUSE_DYNAMIC_SCENE = bool(int(os.environ.get("OCTO_REUSE_SCENE", "0")))
+
 
 def build_and_load_scene(model_path: str, plant_base=(0.5, 0.0, 0.15)):
-    """Generate a new plant, write scene_dynamic.xml, and load model+data."""
+    """Generate a new plant, write scene_dynamic.xml based on template scene, and load."""
     basedir = scene_dir_from_model_path(model_path)
     plant_path = os.path.join(basedir, "tomato_plant.xml")
     scene_path = os.path.join(basedir, "scene_dynamic.xml")
 
-    # 1) Generate a fresh plant file (randomized)
-    generate_tomato_plant_xml(output_file=plant_path, base_pos=plant_base)
+    if _REUSE_DYNAMIC_SCENE and os.path.exists(scene_path):
+        print("[scene] Reusing existing dynamic scene XML (OCTO_REUSE_SCENE=1).")
+    else:
+        # 1) Fresh randomized plant
+        generate_tomato_plant_xml(output_file=plant_path, base_pos=plant_base)
 
-    # 2) Write scene that includes panda + plant
-    write_scene_dynamic(scene_path)
+        # 2) Clone your scene.xml look & swap plant include
+        write_scene_dynamic(scene_path, template_scene_path=model_path)
 
-    # 3) Load it
+    # 3) Load dynamic scene
     model = mujoco.MjModel.from_xml_path(scene_path)
     data  = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
@@ -425,6 +526,140 @@ def harvest_any_tfrecords(root_dir: str, version_dir: str, ds_name: str, split_n
 def repair_tfds_splits(version_dir, name):
     return repair_tfds_splits_at_dir(version_dir, name)
 
+
+def ee_pose(model, data, ee_ref):
+    kind, name = ee_ref
+    if kind == "site":
+        sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
+        pos = data.site_xpos[sid].copy()
+        mat = data.site_xmat[sid].reshape(3,3).copy()
+    else:
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        pos = data.xpos[bid].copy()
+        mat = data.xmat[bid].reshape(-1,3,3)[bid].copy()
+    # convert rotation matrix to axis-angle (magnitude=angle)
+    # MuJoCo has mj_mat2Quat; we’ll do a small utility here:
+    quat = np.empty(4, dtype=float)
+    mujoco.mju_mat2Quat(quat, mat.flatten())
+    return pos, quat
+
+def quat_ang_dist(q1, q2):
+    # shortest-angle distance between orientations
+    dq = np.array([q2[0]*q1[0] + q2[1]*q1[1] + q2[2]*q1[2] + q2[3]*q1[3]], dtype=float)  # dot
+    dq = np.clip(dq, -1.0, 1.0)
+    return 2.0 * np.arccos(np.abs(dq))[0]
+
+def trapezoid_times(total, vmax, amax):
+    """Return cumulative times for a 1D path of length `total` under trapezoid limits."""
+    total = float(max(total, 0.0))
+    if total <= 1e-9:
+        return [0.0]
+    t_acc = vmax / amax
+    d_acc = 0.5 * amax * t_acc**2
+    if 2*d_acc >= total:  # triangle
+        t_acc = np.sqrt(total / amax)
+        t_peak = t_acc
+        t_total = 2*t_acc
+    else:
+        d_cruise = total - 2*d_acc
+        t_cruise = d_cruise / vmax
+        t_peak = t_acc + t_cruise
+        t_total = 2*t_acc + t_cruise
+    return [0.0, t_peak, t_total]
+
+def time_parameterize_by_ee_limits(model, data, arm_qpos_addr, ee_ref,
+                                    traj_q: np.ndarray,
+                                    rate_hz: float,
+                                    vmax_trans: float, amax_trans: float,
+                                    vmax_rot: float,   amax_rot: float) -> np.ndarray:
+    """Resample joint waypoints so that EE motion obeys trans/rot trapezoidal limits, then sample at `rate_hz`."""
+    if len(traj_q) < 2:
+        return traj_q.astype(np.float32, copy=False)
+
+    # FK: EE positions and orientation deltas
+    pos_list, quat_list = [], []
+    _bak = data.qpos.copy()
+    for q in traj_q:
+        data.qpos[arm_qpos_addr] = q[:7]
+        mujoco.mj_forward(model, data)
+        p, qh = _ee_pose(model, data, ee_ref)
+        pos_list.append(p); quat_list.append(qh.copy())
+    data.qpos[:] = _bak; mujoco.mj_forward(model, data)
+
+    pos = np.stack(pos_list, axis=0)
+    # translational arc-length along the polyline
+    dp = np.linalg.norm(np.diff(pos, axis=0), axis=1)
+    s_trans = np.concatenate([[0.0], np.cumsum(dp)])
+    total_trans = float(s_trans[-1])
+
+    # rotational arc (angle distance)
+    dang = [0.0]
+    for i in range(1, len(quat_list)):
+        dang.append(_quat_ang_dist(quat_list[i-1], quat_list[i]))
+    s_rot = np.cumsum(dang)
+    s_rot = np.concatenate([[0.0], s_rot])
+    total_rot = float(s_rot[-1])
+
+    # times to complete each modality under trapezoid, then take the max
+    t_marks_trans = _trapezoid_times(total_trans, vmax_trans, amax_trans)
+    t_marks_rot   = _trapezoid_times(total_rot,   vmax_rot,   amax_rot)
+    t_total = max(t_marks_trans[-1], t_marks_rot[-1])
+
+    # Desired sampling at fixed rate_hz
+    if rate_hz <= 0:
+        rate_hz = 10.0
+    dt = 1.0 / float(rate_hz)
+    times = np.arange(0.0, t_total + 1e-9, dt)
+
+    # Map desired time -> path fraction for each modality, then choose the limiting fraction
+    def frac_from_trap(t, t_marks, total):
+        t = float(np.clip(t, 0.0, t_marks[-1]))
+        if len(t_marks) == 1 or total <= 1e-12:
+            return 0.0
+        # compute trapezoid params
+        if len(t_marks) == 3:
+            t_acc, t_peak, t_total_loc = t_marks[0], t_marks[1], t_marks[2]
+        else:
+            t_acc, t_peak, t_total_loc = 0.0, t_marks[0], t_marks[-1]
+        vmax = vmax_trans if total == total_trans else vmax_rot
+        amax = amax_trans if total == total_trans else amax_rot
+
+        if 2*(0.5*amax*(vmax/amax)**2) >= total:  # triangle case recompute
+            t_acc = np.sqrt(total/amax)
+            t_peak = t_acc
+            t_total_loc = 2*t_acc
+
+        if t <= t_acc:
+            s = 0.5*amax*t**2
+        elif t <= t_peak:
+            s = 0.5*amax*t_acc**2 + vmax*(t - t_acc)
+        else:
+            t_dec = t - t_peak
+            s = total - 0.5*amax*(t_total_loc - t)**2
+        return float(np.clip(s / max(total, 1e-12), 0.0, 1.0))
+
+    fracs = []
+    for t in times:
+        f_trans = frac_from_trap(t, t_marks_trans, total_trans)
+        f_rot   = frac_from_trap(t, t_marks_rot,   total_rot)
+        fracs.append(max(f_trans, f_rot))
+    fracs = np.asarray(fracs)
+
+    # Convert path fractions to indices over the original joint path (piecewise linear)
+    idx_float = fracs * (len(traj_q) - 1)
+    idx0 = np.floor(idx_float).astype(int)
+    idx1 = np.clip(idx0 + 1, 0, len(traj_q) - 1)
+    alpha = (idx_float - idx0).reshape(-1, 1).astype(np.float32)
+
+    traj_resampled = (1.0 - alpha) * traj_q[idx0, :7] + alpha * traj_q[idx1, :7]
+    if traj_q.shape[1] > 7:
+        g = (1.0 - alpha[:,0]) * traj_q[idx0, 7] + alpha[:,0] * traj_q[idx1, 7]
+        traj_out = np.concatenate([traj_resampled, g[:, None]], axis=1)
+    else:
+        traj_out = traj_resampled
+    return traj_out.astype(np.float32, copy=False)
+
+
 # Backward-compatible aliases (so you can import with underscores if you like)
 _damped_pinv = damped_pinv
 _body_pos = body_pos
@@ -438,6 +673,7 @@ _write_scene_dynamic = write_scene_dynamic
 _scene_dir_from_model_path = scene_dir_from_model_path
 _weighted_dls = weighted_dls
 _place_frame_mocap = place_frame_mocap
+_compute_joint_delta_action = compute_joint_delta_action
 _choose_split_for_plant = choose_split_for_plant
 _choose_split_for_episode = choose_split_for_episode
 _expected_ds_dir = expected_ds_dir
@@ -445,6 +681,12 @@ _move_stray_shards_into_version_dir = move_stray_shards_into_version_dir
 _repair_tfds_splits_at_dir = repair_tfds_splits_at_dir
 _harvest_any_tfrecords = harvest_any_tfrecords
 _repair_tfds_splits = repair_tfds_splits
+_ee_pose = ee_pose
+_quat_ang_dist = quat_ang_dist
+_trapezoid_times = trapezoid_times
+_time_parameterize_by_ee_limits = time_parameterize_by_ee_limits 
+
+
 
 # ------------------------------- Self-test ------------------------------------
 
