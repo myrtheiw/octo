@@ -688,6 +688,7 @@ _time_parameterize_by_ee_limits = time_parameterize_by_ee_limits
 
 
 
+
 # ------------------------------- Self-test ------------------------------------
 
 def approx_body_radius_max(model, body_id, pad=0.01, default=0.03):

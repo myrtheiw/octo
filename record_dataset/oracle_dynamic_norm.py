@@ -30,7 +30,7 @@ import numpy as np
 import mujoco
 import dm_env
 from dm_env import specs, TimeStep
-import json, re, glob, os, shutil
+import json, re, glob, os, shutil, hashlib
 
 try:
     import imageio.v2 as _imageio
@@ -164,6 +164,7 @@ TYPICAL_FRANKA_LIMITS = [
     (-2.8973,  2.8973),
 ]
 
+
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
 EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 100))
@@ -171,7 +172,7 @@ EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.34")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.40")
 
 _DEFAULT_GOAL_IMAGE_OUTPUT_DIR = (
     Path(__file__).resolve().parents[1] / "outputs" / "goal_images"
@@ -189,6 +190,15 @@ def _ensure_goal_dir_exists():
     except Exception as exc:
         print(f"[GOAL_IMG] unable to create directory '{GOAL_IMAGE_OUTPUT_DIR}': {exc}")
         return False
+
+def _normalize_delta(delta: np.ndarray) -> np.ndarray:
+    """
+    Normalize a raw joint delta Δq (radians) into approx [-1, 1] using JOINT_DELTA_SCALE.
+    """
+    delta = np.asarray(delta, dtype=np.float32).reshape(7)
+    scaled = delta / JOINT_DELTA_SCALE
+    # Hard clamp to Octo-style range
+    return np.clip(scaled, -1.0, 1.0).astype(np.float32, copy=False)
 
 
 def _write_goal_image(path: str, image: np.ndarray) -> None:
@@ -226,86 +236,79 @@ DATASET_ACTION_SCALE = 1.0   # action labels store Δq / scale; match this with 
 DATASET_MIN_STEP_NORM = 1e-3   # drop frames whose joint delta is below this (radians)
 DATASET_FINAL_HOLD_STEPS = 10  # small hold appended after deduplication for stability
 DATASET_MAX_STEP_RAD = 2.0e-2  # clamp per-step joint deltas by inserting interpolated waypoints
-ACTION_NORM_STATS_FILENAME = "action_normalization_stats.json"
+JOINT_DELTA_SCALE = np.full(7, DATASET_MAX_STEP_RAD, dtype=np.float32)
 
+class ActionDeltaStatistics:
+    """Accumulates raw Δq statistics for Octo-compatible normalization metadata."""
 
-class ActionDeltaNormalizer:
-    """Tracks per-joint Δq statistics and normalizes actions to [-1, 1]."""
-
-    def __init__(self, action_dim: int = 7, eps: float = 1e-8):
+    def __init__(self, action_dim: int = 7):
         self.action_dim = int(action_dim)
-        self.eps = float(eps)
-        self._min = np.full(self.action_dim, np.inf, dtype=np.float64)
-        self._max = np.full(self.action_dim, -np.inf, dtype=np.float64)
-        self._mean = np.zeros(self.action_dim, dtype=np.float64)
-        self._m2 = np.zeros(self.action_dim, dtype=np.float64)
-        self._count = 0
+        self._values: list[np.ndarray] = []
+        self.num_transitions = 0
 
-    def _update(self, delta: np.ndarray) -> None:
-        delta64 = np.asarray(delta, dtype=np.float64).reshape(self.action_dim)
-        self._min = np.minimum(self._min, delta64)
-        self._max = np.maximum(self._max, delta64)
-        self._count += 1
-        delta_mean = delta64 - self._mean
-        self._mean += delta_mean / float(self._count)
-        self._m2 += delta_mean * (delta64 - self._mean)
+    def observe(self, delta: np.ndarray) -> None:
+        arr = np.asarray(delta, dtype=np.float32).reshape(self.action_dim)
+        self._values.append(arr.copy())
+        self.num_transitions += 1
 
-    def observe_and_normalize(self, delta: np.ndarray) -> np.ndarray:
-        """Update stats with `delta` and return its normalized value."""
-        delta = np.asarray(delta, dtype=np.float32).reshape(self.action_dim)
-        self._update(delta)
-        rng = self._max - self._min
-        norm = np.zeros_like(delta, dtype=np.float32)
-        valid = rng > self.eps
-        if np.any(valid):
-            norm_vals = (
-                2.0 * (delta[valid] - self._min[valid]) / rng[valid] - 1.0
-            )
-            norm[valid] = norm_vals.astype(np.float32, copy=False)
-        np.clip(norm, -1.0, 1.0, out=norm)
-        return norm
+    def _stack(self) -> np.ndarray:
+        if not self._values:
+            return np.zeros((0, self.action_dim), dtype=np.float32)
+        return np.stack(self._values, axis=0)
 
-    @property
-    def count(self) -> int:
-        return int(self._count)
-
-    def to_metadata(self, dataset_name: str, dataset_version: str) -> dict:
-        if self._count == 0:
-            min_arr = [0.0] * self.action_dim
-            max_arr = [0.0] * self.action_dim
-            mean_arr = [0.0] * self.action_dim
-            std_arr = [0.0] * self.action_dim
-        else:
-            min_arr = np.asarray(self._min, dtype=np.float64).tolist()
-            max_arr = np.asarray(self._max, dtype=np.float64).tolist()
-            mean_arr = np.asarray(self._mean, dtype=np.float64).tolist()
-            if self._count > 1:
-                std = np.sqrt(self._m2 / float(self._count - 1))
-            else:
-                std = np.zeros_like(self._mean)
-            std_arr = std.tolist()
-
-        metadata = {
-            "dataset_name": dataset_name,
-            "dataset_version": dataset_version,
-            "action": {
-                "min": min_arr,
-                "max": max_arr,
-                "mean": mean_arr,
-                "std": std_arr,
+    def compute_statistics(self) -> dict:
+        values = self._stack()
+        if values.size == 0:
+            zero = [0.0] * self.action_dim
+            return {
+                "min": zero,
+                "max": zero,
+                "mean": zero,
+                "std": zero,
+                "p01": zero,
+                "p99": zero,
                 "mask": [True] * self.action_dim,
-                "normalization_type": "per_joint_min_max",
-                "formula": "a_norm = 2 * (a - min) / (max - min) - 1",
-            },
-            "num_transitions": self.count,
-        }
-        return metadata
+            }
 
-    def save(self, path: str, dataset_name: str, dataset_version: str) -> None:
-        metadata = self.to_metadata(dataset_name, dataset_version)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        stats = {
+            "min": values.min(axis=0).tolist(),
+            "max": values.max(axis=0).tolist(),
+            "mean": values.mean(axis=0).tolist(),
+            "std": values.std(axis=0).tolist(),
+            "p01": np.quantile(values, 0.01, axis=0).tolist(),
+            "p99": np.quantile(values, 0.99, axis=0).tolist(),
+            "mask": [True] * self.action_dim,
+        }
+        return stats
+
+    def write_dataset_statistics(
+        self,
+        directory: str,
+        dataset_name: str,
+        dataset_version: str,
+        num_trajectories: int,
+    ) -> str:
+        stats = self.compute_statistics()
+        metadata = {
+            "action": stats,
+            "num_transitions": self.num_transitions,
+            "num_trajectories": num_trajectories,
+        }
+        hash_components = (
+            dataset_name,
+            dataset_version,
+            f"action_dim={self.action_dim}",
+            "oracle_dynamic_norm",
+        )
+        unique_hash = hashlib.sha256(
+            "".join(hash_components).encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
+        filename = f"dataset_statistics_{unique_hash}.json"
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, filename)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)
+        return path
 
 
 
@@ -1303,7 +1306,7 @@ def run_oracle_once(
     env, base_env, model, data, arm_dof_idx, arm_qpos_addr, ee_ref,
     goal_pos, obstacles=None, goal_body_name=None,
     waypoints=None, dry_run=False, goal_frame_idx=None,
-    action_normalizer: ActionDeltaNormalizer | None = None,
+    action_delta_stats: ActionDeltaStatistics | None = None,
 ):
     """
     Plans and executes an oracle trajectory toward goal_pos.
@@ -1319,10 +1322,8 @@ def run_oracle_once(
     """
 
     # ---- Reset state ----
-    scale = float(DATASET_ACTION_SCALE)
-    if not np.isclose(scale, 1.0, atol=1e-9):
-        raise ValueError("DATASET_ACTION_SCALE must remain 1.0 for joint_delta logging.")
     data.qpos[arm_qpos_addr] = START_JOINTS
+
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
     q_start = data.qpos[arm_qpos_addr].copy()
@@ -1562,30 +1563,21 @@ def run_oracle_once(
     if env is None:
         raise RuntimeError("Logged run requested but `env` is None. Use dry_run=True for QC or pass an EnvLogger.")
 
-    # We will EXECUTE with waypoints (PD ignores the action argument),
-    # but we will LOG the *executed* Δq from proprio.
+
+    # EXECUTE with waypoints (PD ignores the action argument),
+    # LOG the *executed* Δq from proprio (normalized).
     base_env.set_waypoints(waypoints)
-    base_env.control_mode = "waypoints"    # <-- execution decoupled from action arg
+    base_env.control_mode = "waypoints"
     base_env.reset(waypoints=waypoints)
 
-    # 1) PRIME STEP (no logging yet): run one PD step to get the first executed Δq
-    #    We run the PD step by calling base_env.step directly (NOT env),
-    #    so EnvLogger does not log this prime step.
+    # 1) PRIME STEP (no logging yet)
     q_prev = base_env.data.qpos[arm_qpos_addr].copy()
-    _ = base_env.step(action=np.zeros(7, dtype=np.float32))  # action ignored in 'waypoints' mode
+    _ = base_env.step(action=np.zeros(7, dtype=np.float32))  # ignored in 'waypoints' mode
     q_now  = base_env.data.qpos[arm_qpos_addr].copy()
     a_exec_prev = (q_now[:7] - q_prev[:7]).astype(np.float32)
 
-    # Now start the logger at obs = current state (after prime),
-    # so the first "logged" transition will receive the executed Δq we just measured.
+    # Start EnvLogger from this state
     env.reset()
-
-    action_norm_active = (action_normalizer is not None)
-
-    def _prepare_action(delta: np.ndarray) -> np.ndarray:
-        if action_norm_active:
-            return action_normalizer.observe_and_normalize(delta)
-        return delta
 
     # Optional live view
     if LIVE_RENDER:
@@ -1594,16 +1586,18 @@ def run_oracle_once(
             last_t = time.perf_counter()
             done = False
             while v.is_running() and not done:
-                # 2) LOG the executed Δq from the *previous* transition.
-                #    Execution will advance one more PD step under waypoints mode.
-                done = env.step(_prepare_action(a_exec_prev)).last()
+                # 2) Log raw Δq stats and send normalized Δq to the logger
+                if action_delta_stats is not None:
+                    action_delta_stats.observe(a_exec_prev)          # raw radians
+                a_log_prev = _normalize_delta(a_exec_prev)           # normalized [-1, 1]
+                done = env.step(a_log_prev).last()
 
-                # 3) Immediately compute executed Δq for THIS transition (to use next loop)
+                # 3) Measure executed Δq for NEXT transition
                 q_next_prev = q_now.copy()
                 q_now = base_env.data.qpos[arm_qpos_addr].copy()
                 a_exec_prev = (q_now[:7] - q_next_prev[:7]).astype(np.float32)
 
-                # pacing
+                # pacing + viewer sync
                 now = time.perf_counter()
                 if now - last_t < period:
                     time.sleep(max(0.0, period - (now - last_t)))
@@ -1612,14 +1606,16 @@ def run_oracle_once(
     else:
         done = False
         while not done:
-            # step + log the executed Δq we just measured
-            done = env.step(_prepare_action(a_exec_prev)).last()
+            # Log + step exactly once per outer step
+            if action_delta_stats is not None:
+                action_delta_stats.observe(a_exec_prev)          # raw radians
+            a_log_prev = _normalize_delta(a_exec_prev)           # normalized [-1, 1]
+            done = env.step(a_log_prev).last()
 
-            # measure the newly executed Δq for the *next* log call
+            # Measure executed Δq for the NEXT step
             q_next_prev = q_now.copy()
             q_now = base_env.data.qpos[arm_qpos_addr].copy()
             a_exec_prev = (q_now[:7] - q_next_prev[:7]).astype(np.float32)
-
     # Done; report final error
     ee_pos, _ = _ee_pose(model, data, ee_ref)
     err_final = float(np.linalg.norm(goal_pos - ee_pos))
@@ -1635,7 +1631,7 @@ def _site_exists(model, name: str) -> bool:
 def main():
     os.makedirs(TFDS_ROOT_DIR, exist_ok=True)
     rng = np.random.default_rng(0)
-    action_normalizer = ActionDeltaNormalizer(action_dim=7)
+    action_delta_stats = ActionDeltaStatistics(action_dim=7)
 
     episodes_done = 0
     plant_idx = 0
@@ -1799,7 +1795,7 @@ def main():
                             arm_dof_idx=arm_dof_idx, arm_qpos_addr=arm_qpos_addr, ee_ref=ee_ref,
                             goal_pos=goal_pos, obstacles=obstacles, goal_body_name=truss_name,
                             waypoints=waypoints, dry_run=False, goal_frame_idx=goal_frame_idx,
-                            action_normalizer=action_normalizer,
+                            action_delta_stats=action_delta_stats,
                         )
 
                     episodes_done += 1
@@ -1833,9 +1829,10 @@ def main():
     _ensure_min_train_split(version_dir, DATASET_NAME)
     repair_tfds_splits(version_dir, DATASET_NAME)
 
-    stats_path = os.path.join(version_dir, ACTION_NORM_STATS_FILENAME)
-    action_normalizer.save(stats_path, DATASET_NAME, DATASET_VERSION)
-    print(f"[ACTION_NORM] saved Δq stats to {stats_path}")
+    stats_path = action_delta_stats.write_dataset_statistics(
+        version_dir, DATASET_NAME, DATASET_VERSION, num_trajectories=episodes_done
+    )
+    print(f"[ACTION_NORM] saved Δq dataset_statistics to {stats_path}")
 
     print(f"✅ RLDS/TFDS episodes are under: {version_dir}")
 
