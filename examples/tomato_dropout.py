@@ -16,6 +16,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ.setdefault("MUJOCO_GL", "egl") 
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from pathlib import Path
 
 
@@ -27,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from absl import app, flags, logging
 import gym
 import jax
+import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
@@ -57,6 +59,9 @@ GRIP_CLOSE_NORM = 0.0   # normalized "closed"
 FREEZE_DIST_M = SUCCESS_DIST_M        # start holding pose when within this distance
 FREEZE_HOLD_STEPS = 20        # hold for N outer env steps once triggered
 # =============================================================================
+
+MC_DROPOUT_SAMPLES = 10
+SUCCESS_RETURN_THRESHOLD = 0.0  # Task-dependent fallback when no success flag exists.
 
 
 try:
@@ -140,7 +145,7 @@ flags.DEFINE_bool(
 )
 flags.DEFINE_bool(
     "debug_use_dataset_actions", 
-    True, 
+    False, 
     "If True, ignores the model policy and feeds ground-truth dataset actions into the sim."
 )
 
@@ -436,7 +441,7 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
         # Renderer (keep your existing approach)
         self._renderer = mujoco.Renderer(self.model, height=256, width=256)
         self.success_dist = SUCCESS_DIST_M
-        self.success_hold_steps = 3
+        self.success_hold_steps = 1
         self._success_streak = 0
         self.ee_ref = _choose_ee_ref(self.model)
         print(f"[EE_REF] using {self.ee_ref}", flush=True)
@@ -467,6 +472,15 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
         self._last_q_target_cmd = None
         self._last_grip_cmd = None  # optional, but useful
         self._done_latched = False
+        self._freeze_debug_enabled = True
+        self._freeze_debug_window = 5
+        self._freeze_debug_step = 0
+        self._freeze_latch_step = None
+        self._freeze_debug_buffer = []
+        self._freeze_debug_printed_steps = set()
+        self._freeze_last_dist = None
+        self._freeze_last_qpos = None
+        self._freeze_last_action_norm = None
 
 
 
@@ -506,6 +520,13 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
         self._freeze_steps_left = 0
         self._freeze_q_target = None
         self._done_latched = False
+        self._freeze_debug_step = 0
+        self._freeze_latch_step = None
+        self._freeze_debug_buffer = []
+        self._freeze_debug_printed_steps = set()
+        self._freeze_last_dist = None
+        self._freeze_last_qpos = None
+        self._freeze_last_action_norm = None
 
 
 
@@ -560,16 +581,26 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
             a = a.reshape(-1)
         if a.shape[0] < 7:
             raise ValueError(f"Expected action with >=7 dims, got shape {a.shape}")
+        self._freeze_debug_step += 1
+        step_idx = self._freeze_debug_step
+        q_before = self.data.qpos[self.arm_qpos_adr].copy().astype(np.float64)
+        freeze_active_at_start = bool(getattr(self, "_freeze_active", False))
+        freeze_left_at_start = int(getattr(self, "_freeze_steps_left", 0))
 
         # Keep arm dims and clamp to normalized range
         a7 = np.clip(a[:7], -1.0, 1.0).astype(np.float64, copy=False)
 
         # --- 1) Convert normalized delta -> radians ---
         dq = a7 * float(self.ORACLE_SCALE)  # radians
+        dq_norm = float(np.linalg.norm(dq))
+        a_min = float(a7.min())
+        a_max = float(a7.max())
+        self._freeze_last_action_norm = dq_norm
 
         # --- 2) Compute absolute target from CURRENT measured q (no integration) ---
         q_meas = self.data.qpos[self.arm_qpos_adr].copy().astype(np.float64)
         q_target = q_meas + dq
+        q_target_candidate = q_target.copy()
 
         # --- 3) Build cache: qpos_adr -> joint id (once) ---
         if not hasattr(self, "_arm_qadr_to_jid"):
@@ -611,6 +642,7 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
 
 
 
+        freeze_latched_this_step = False
         freeze_expired = False
         if getattr(self, "_freeze_active", False):
             if self._freeze_q_target is not None:
@@ -621,6 +653,7 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
                     freeze_expired = True
 
             # Recommended: keep freeze active until episode ends (do nothing here).
+        q_target_applied = q_target.copy()
 
         # ----------------------------------------------------------------------
         # Gripper schedule: open until close-trigger, then ramp closed
@@ -668,6 +701,8 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
             mujoco.mj_step(self.model, self.data)
 
         # After physics sub-steps, compute post-step distance
+        q_after = self.data.qpos[self.arm_qpos_adr].copy().astype(np.float64)
+        moved = float(np.linalg.norm(q_after - q_before))
         dist_post = None
         goal_pos = getattr(self, "goal_pos", None)
         if goal_pos is not None:
@@ -685,7 +720,83 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
             self._freeze_steps_left = int(FREEZE_HOLD_STEPS)
             # Hold the *current measured* pose to prevent drift
             self._freeze_q_target = self.data.qpos[self.arm_qpos_adr].copy()
+            self._freeze_latch_step = step_idx
+            freeze_latched_this_step = True
             print(f"[FREEZE] latch dist_post={dist_post:.4f}", flush=True)
+
+        if getattr(self, "_freeze_debug_enabled", False):
+            freeze_active_after = bool(getattr(self, "_freeze_active", False))
+            freeze_left_after = int(getattr(self, "_freeze_steps_left", 0))
+            frozen_target = self._freeze_q_target
+            q_applied_matches_frozen = None
+            if freeze_active_after and frozen_target is not None:
+                q_applied_matches_frozen = bool(
+                    np.allclose(q_target_applied, frozen_target, atol=1e-6, rtol=0.0)
+                )
+
+            rec = {
+                "t": step_idx,
+                "dist_post": dist_post,
+                "freeze_start": freeze_active_at_start,
+                "freeze_end": freeze_active_after,
+                "freeze_left_start": freeze_left_at_start,
+                "freeze_left_end": freeze_left_after,
+                "dq_norm": dq_norm,
+                "a_min": a_min,
+                "a_max": a_max,
+                "moved": moved,
+                "q_applied_matches_frozen": q_applied_matches_frozen,
+                "freeze_latched": freeze_latched_this_step,
+            }
+            self._freeze_debug_buffer.append(rec)
+            if len(self._freeze_debug_buffer) > self._freeze_debug_window + 1:
+                self._freeze_debug_buffer = self._freeze_debug_buffer[-(self._freeze_debug_window + 1):]
+
+            if freeze_latched_this_step:
+                for buffered in self._freeze_debug_buffer:
+                    t_buf = buffered["t"]
+                    if t_buf in self._freeze_debug_printed_steps:
+                        continue
+                    print(
+                        "[FREEZE CHECK] "
+                        f"t={t_buf} dist={buffered['dist_post']} freeze(active:start->end)="
+                        f"{buffered['freeze_start']}->{buffered['freeze_end']} "
+                        f"left={buffered['freeze_left_start']}->{buffered['freeze_left_end']} "
+                        f"dq_norm={buffered['dq_norm']:.3e} "
+                        f"moved={buffered['moved']:.3e} "
+                        f"q_applied_matches_frozen={buffered['q_applied_matches_frozen']}",
+                        flush=True,
+                    )
+                    self._freeze_debug_printed_steps.add(t_buf)
+
+            should_print = freeze_active_after
+            if self._freeze_latch_step is not None:
+                if abs(step_idx - self._freeze_latch_step) <= int(self._freeze_debug_window):
+                    should_print = True
+
+            if should_print and step_idx not in self._freeze_debug_printed_steps:
+                print(
+                    "[FREEZE CHECK] "
+                    f"t={step_idx} dist={dist_post} freeze(active:start->end)="
+                    f"{freeze_active_at_start}->{freeze_active_after} "
+                    f"left={freeze_left_at_start}->{freeze_left_after} "
+                    f"dq_norm={dq_norm:.3e} moved={moved:.3e} "
+                    f"q_applied_matches_frozen={q_applied_matches_frozen}",
+                    flush=True,
+                )
+                self._freeze_debug_printed_steps.add(step_idx)
+
+            if freeze_active_after:
+                motion_cmd_active = dq_norm > 1e-12
+                moved_too_much = moved > 1e-4
+                target_mismatch = (q_applied_matches_frozen is False)
+                if motion_cmd_active or target_mismatch or moved_too_much:
+                    print(
+                        "[FREEZE ERROR] Freeze active but motion not overridden: "
+                        f"dq_norm={dq_norm:.3e} moved={moved:.3e} "
+                        f"q_applied_matches_frozen={q_applied_matches_frozen}",
+                        flush=True,
+                    )
 
         # --- 7) Success termination (distance-to-goal) ---
         terminated = False
@@ -880,6 +991,61 @@ class ChunkLogger:
     def close(self):
         if self._fp: self._fp.close()
 
+def sample_mc_actions(model, obs, task, n_samples=MC_DROPOUT_SAMPLES, base_rng=None):
+    if base_rng is None:
+        base_rng = jax.random.PRNGKey(np.random.randint(0, 1_000_000))
+
+    obs_batched = jax.tree_map(lambda x: x[None], obs)
+    rngs = jax.random.split(base_rng, n_samples)
+
+    def single_sample(rng_key):
+        return model.sample_actions(
+            obs_batched,
+            task,
+            train=True,
+            rng=rng_key,
+            unnormalization_statistics=model.dataset_statistics["action"],
+        )[0]
+
+    actions = jax.lax.map(single_sample, rngs)
+    return actions
+
+def _coerce_bool(value):
+    try:
+        arr = np.asarray(value)
+        if arr.shape == ():
+            return bool(arr.item())
+    except Exception:
+        pass
+    return bool(value)
+
+def detect_success(info, episode_return, threshold=SUCCESS_RETURN_THRESHOLD):
+    if isinstance(info, dict):
+        if "is_success" in info:
+            return _coerce_bool(info["is_success"])
+        if "success" in info:
+            return _coerce_bool(info["success"])
+        episode_info = info.get("episode")
+        if isinstance(episode_info, dict):
+            if "success" in episode_info:
+                return _coerce_bool(episode_info["success"])
+            if "is_success" in episode_info:
+                return _coerce_bool(episode_info["is_success"])
+        final_info = info.get("final_info")
+        if isinstance(final_info, dict):
+            if "success" in final_info:
+                return _coerce_bool(final_info["success"])
+            if "is_success" in final_info:
+                return _coerce_bool(final_info["is_success"])
+    return float(episode_return) >= float(threshold)
+
+def get_condition_name(info, default="default"):
+    if isinstance(info, dict):
+        for key in ("condition", "env_condition", "domain"):
+            if key in info:
+                return str(info[key])
+    return default
+
 def main(_):
     wandb.init(name="eval_tomato", project="octo")
     logging.info("Loading finetuned model...")
@@ -918,6 +1084,10 @@ def main(_):
     if not FLAGS.use_dataset_trajectory:
         import random 
         num_eval_episodes = 1 
+        episode_uncertainties = []
+        episode_successes = []
+        episode_conditions = []
+        episode_returns = []
 
         for episode_index in range(num_eval_episodes):
             
@@ -1099,10 +1269,13 @@ def main(_):
                 # -------------------------------
 
                 task = model.create_tasks(texts=env.get_task()["language_instruction"])
+                condition_name = get_condition_name(info, default="default")
                 first = obs["image_primary"][-1] if obs["image_primary"].ndim == 4 else obs["image_primary"]
                 images = [first]
 
                 episode_return = 0.0
+                step_uncertainties = []
+                last_info = info
                 step_count = 0
                 while len(images) < 400:
                     
@@ -1121,9 +1294,17 @@ def main(_):
                             logging.warning("Ran out of dataset actions, stopping.")
                             break
                     else:
-                        batched_obs = jax.tree_map(lambda x: x[None], obs)
-                        policy_out = policy_fn(batched_obs, task)
-                        policy_chunk = np.asarray(policy_out[0], dtype=np.float32)  # shape (H, action_dim)
+                        mc_actions = sample_mc_actions(
+                            model,
+                            obs,
+                            task,
+                            n_samples=MC_DROPOUT_SAMPLES,
+                            base_rng=jax.random.PRNGKey(np.random.randint(1e6)),
+                        )
+                        action_mean = jnp.mean(mc_actions, axis=0)
+                        action_std = jnp.std(mc_actions, axis=0)
+                        step_uncertainties.append(float(jnp.mean(action_std)))
+                        policy_chunk = np.asarray(action_mean, dtype=np.float32)  # shape (H, action_dim)
 
 
                         # print("--- DEBUG STEP ---")
@@ -1155,6 +1336,7 @@ def main(_):
    
 
                     obs, reward, done, trunc, info = env.step(delta_norm)
+                    last_info = info
                     # Collect EE-to-goal distances at the finest granularity we can find.
                     # Depending on wrappers, per-inner-step infos may be in info["infos"] (best),
                     # otherwise we fall back to a single scalar in info["ee_goal_dist"].
@@ -1213,9 +1395,35 @@ def main(_):
                     episode_return += reward
                     # print("[STOP CHECK] step_count=", step_count, "len(actions)=", len(gt_actions_queue), flush=True)
 
-                    if done or trunc: break
+                    if done or trunc:
+                        print(
+                            f"[EP END] step={step_count} done={done} trunc={trunc} "
+                            f"dist={info.get('ee_goal_dist', None)} "
+                            f"is_success={info.get('is_success', None)} "
+                            f"terminated_by_freeze={info.get('terminated_by_freeze', False)} "
+                            f"success_streak={getattr(env.unwrapped.panda_env, '_success_streak', None)} "
+                            f"freeze_active={getattr(env.unwrapped.panda_env, '_freeze_active', None)} "
+                            f"freeze_left={getattr(env.unwrapped.panda_env, '_freeze_steps_left', None)}",
+                            flush=True,
+                        )
+                        break
+
                 
                 print(f"Episode return: {episode_return}")
+                episode_uncertainty = float(np.mean(step_uncertainties)) if step_uncertainties else 0.0
+                episode_success = detect_success(last_info, episode_return, SUCCESS_RETURN_THRESHOLD)
+                episode_uncertainties.append(episode_uncertainty)
+                episode_successes.append(bool(episode_success))
+                episode_conditions.append(condition_name)
+                episode_returns.append(float(episode_return))
+
+                logging.info(
+                    "Episode %d metrics: return=%.3f success=%s uncertainty=%.6f",
+                    episode_index,
+                    episode_return,
+                    episode_success,
+                    episode_uncertainty,
+                )
                 num_dataset_steps = min(step_count, FLAGS.policy_start_timestep)
                 num_policy_steps = max(0, step_count - FLAGS.policy_start_timestep)
 
@@ -1238,11 +1446,104 @@ def main(_):
                 np.save(os.path.join(plot_dir, f"distance_curve_ep{episode_index:03d}.npy"),
                         np.asarray(distance_curve, dtype=np.float32))
 
+                trace_logger.log_chunk(
+                    event="episode_end",
+                    episode_index=episode_index,
+                    episode_return=episode_return,
+                    episode_success=bool(episode_success),
+                    episode_uncertainty=episode_uncertainty,
+                    condition=condition_name,
+                )
+
+                wandb.log({
+                    "rollout/episode_index": episode_index,
+                    "rollout/episode_return": float(episode_return),
+                    "rollout/episode_success": int(bool(episode_success)),
+                    "rollout/episode_uncertainty": float(episode_uncertainty),
+                })
 
                 wandb.log({"rollout_video": wandb.Video(np.array(images).transpose(0, 3, 1, 2)[::2])})
 
             finally:
                 trace_logger.close()
+        if episode_uncertainties:
+            plot_dir = os.path.dirname(FLAGS.debug_trace_path) if FLAGS.debug_trace_path else "."
+            condition_names = sorted(set(episode_conditions))
+            color_map = plt.get_cmap("tab10")
+            condition_colors = {
+                name: color_map(i % color_map.N) for i, name in enumerate(condition_names)
+            }
+
+            plt.figure(figsize=(8, 4))
+            ax = plt.gca()
+            for idx, (uncertainty, success, condition) in enumerate(
+                zip(episode_uncertainties, episode_successes, episode_conditions)
+            ):
+                marker = "o" if success else "x"
+                ax.scatter(
+                    idx + 1,
+                    uncertainty,
+                    marker=marker,
+                    color=condition_colors.get(condition, "black"),
+                )
+            ax.set_xlabel("Episode Index")
+            ax.set_ylabel("Per-Episode Uncertainty")
+            ax.set_title("MC Dropout Uncertainty vs Episode Outcome")
+            ax.set_ylim(bottom=0)
+
+            condition_handles = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor=condition_colors[name],
+                    label=name,
+                    markersize=7,
+                    linestyle="None",
+                )
+                for name in condition_names
+            ]
+            outcome_handles = [
+                Line2D([0], [0], marker="o", color="k", label="Success", linestyle="None"),
+                Line2D([0], [0], marker="x", color="k", label="Failure", linestyle="None"),
+            ]
+            if condition_handles:
+                legend1 = ax.legend(handles=condition_handles, title="Condition", loc="upper right")
+                ax.add_artist(legend1)
+            ax.legend(handles=outcome_handles, title="Outcome", loc="lower right")
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "tomato_mc_uncertainty_scatter.png"))
+            plt.close()
+
+            boxplot_data = []
+            boxplot_labels = []
+            for condition in condition_names:
+                success_vals = [
+                    u for u, s, c in zip(episode_uncertainties, episode_successes, episode_conditions)
+                    if c == condition and s
+                ]
+                failure_vals = [
+                    u for u, s, c in zip(episode_uncertainties, episode_successes, episode_conditions)
+                    if c == condition and not s
+                ]
+                if success_vals:
+                    boxplot_labels.append(f"{condition} / Success")
+                    boxplot_data.append(success_vals)
+                if failure_vals:
+                    boxplot_labels.append(f"{condition} / Failure")
+                    boxplot_data.append(failure_vals)
+
+            if boxplot_data:
+                plt.figure(figsize=(10, 4))
+                plt.boxplot(boxplot_data, labels=boxplot_labels, showfliers=False)
+                plt.ylabel("Per-Episode Uncertainty")
+                plt.title("MC Dropout Uncertainty by Outcome")
+                plt.xticks(rotation=25, ha="right")
+                plt.tight_layout()
+                plt.savefig(os.path.join(plot_dir, "tomato_mc_uncertainty_boxplot.png"))
+                plt.close()
         print("Finished MuJoCo eval")
             
     # -------------------------------------------------------------------------

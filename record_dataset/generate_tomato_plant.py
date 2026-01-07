@@ -139,6 +139,21 @@ def _make_side_stem_with_truss(i: int,
     # Wrap side stem body at its world z height
     return _body(f"side_stem{i}", (0.0, 0.0, height_z), "".join(xml))
 
+def random_plant_params(rng: np.random.Generator):
+    # Jitter pot/plant around nominal (0.4, 0.0, 0.15)
+    x = rng.uniform(0.36, 0.44)
+    y = rng.uniform(-0.05, 0.05)
+    z = 0.15  # keep same height so pot sits on the table
+    base_pos = (float(x), float(y), float(z))
+
+    # Stem height: vary within a reachable band
+    stem_height = float(rng.uniform(0.40, 0.52))
+
+    # Sometimes allow unreachable top stems
+    reachable_top_only = bool(rng.random() < 0.7)
+
+    return dict(base_pos=base_pos, stem_height=stem_height, reachable_top_only=reachable_top_only)
+
 def generate_tomato_plant_xml(output_file: str,
                               seed: Optional[int] = None,
                               base_pos: Tuple[float, float, float] = (0.4, 0.0, 0.15),

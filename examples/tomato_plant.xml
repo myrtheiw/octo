@@ -1,0 +1,111 @@
+<mujoco model="tomato_plant">
+  <worldbody>
+    <geom name="pot" type="cylinder" pos="0.500 0.000 0.075" size="0.100 0.075" rgba="0.4 0.2 0 1" contype="0" conaffinity="0"/>
+    <body name="tomato_plant" pos="0.500 0.000 0.150">
+    <geom type="capsule" fromto="0.000 0.000 0.000 0.000 0.000 0.400" size="0.0040" rgba="0 0.6 0 1"/>
+    <body name="side_stem1" pos="0.000 0.000 0.210">
+    <geom type="capsule" fromto="0.000 0.000 0.000 0.023 0.000 -0.004" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="0.023 0.000 -0.004 0.041 0.000 -0.016" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="0.041 0.000 -0.016 0.058 0.000 -0.029" size="0.0025" rgba="0 0.6 0 1"/>
+    <!-- side_stem1 tip=(0.058,0.000,-0.029) -->
+    <body name="truss1" pos="0.058 0.000 -0.029">
+    <!-- truss: 5 tomatoes, span=0.024 m from tip -->
+    <geom type="capsule" fromto="-0.000 0.000 0.000 -0.003 0.009 -0.015" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.003 0.009 -0.018" size="0.021" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.006 0.000 0.000 -0.008 0.002 -0.024" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.008 0.002 -0.028" size="0.021" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.012 0.000 0.000 -0.015 0.006 -0.017" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.015 0.006 -0.020" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.018 0.000 0.000 -0.016 0.003 -0.022" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.016 0.003 -0.025" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.024 0.000 0.000 -0.026 -0.009 -0.025" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.026 -0.009 -0.028" size="0.023" rgba="1 0 0 1"/>
+    </body>
+    </body>
+    <body name="side_stem2" pos="0.000 0.000 0.258">
+    <geom type="capsule" fromto="0.000 0.000 0.000 -0.026 0.000 -0.004" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="-0.026 0.000 -0.004 -0.045 0.000 -0.016" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="-0.045 0.000 -0.016 -0.065 0.000 -0.029" size="0.0025" rgba="0 0.6 0 1"/>
+    <!-- side_stem2 tip=(-0.065,0.000,-0.029) -->
+    <body name="truss2" pos="-0.065 0.000 -0.029">
+    <!-- truss: 7 tomatoes, span=0.028 m from tip -->
+    <geom type="capsule" fromto="0.000 0.000 0.000 -0.002 -0.002 -0.025" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.002 -0.002 -0.028" size="0.020" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.005 0.000 0.000 0.005 -0.010 -0.028" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.005 -0.010 -0.030" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.009 0.000 0.000 0.010 -0.005 -0.019" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.010 -0.005 -0.022" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.014 0.000 0.000 0.014 -0.001 -0.026" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.014 -0.001 -0.029" size="0.021" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.019 0.000 0.000 0.018 0.005 -0.022" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.018 0.005 -0.026" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.024 0.000 0.000 0.025 0.009 -0.035" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.025 0.009 -0.038" size="0.022" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.028 0.000 0.000 0.028 -0.003 -0.016" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.028 -0.003 -0.019" size="0.018" rgba="1 0 0 1"/>
+    </body>
+    </body>
+    <body name="side_stem3" pos="0.000 0.000 0.276">
+    <geom type="capsule" fromto="0.000 0.000 0.000 0.022 0.000 -0.003" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="0.022 0.000 -0.003 0.039 0.000 -0.011" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="0.039 0.000 -0.011 0.055 0.000 -0.020" size="0.0025" rgba="0 0.6 0 1"/>
+    <!-- side_stem3 tip=(0.055,0.000,-0.020) -->
+    <body name="truss3" pos="0.055 0.000 -0.020">
+    <!-- truss: 6 tomatoes, span=0.029 m from tip -->
+    <geom type="capsule" fromto="-0.000 0.000 0.000 -0.001 0.003 -0.018" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.001 0.003 -0.020" size="0.022" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.006 0.000 0.000 -0.004 0.001 -0.029" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.004 0.001 -0.032" size="0.022" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.012 0.000 0.000 -0.009 -0.000 -0.018" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.009 -0.000 -0.021" size="0.020" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.018 0.000 0.000 -0.016 0.001 -0.029" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.016 0.001 -0.033" size="0.020" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.024 0.000 0.000 -0.024 0.006 -0.021" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.024 0.006 -0.024" size="0.023" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.029 0.000 0.000 -0.028 -0.007 -0.016" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.028 -0.007 -0.019" size="0.021" rgba="1 0 0 1"/>
+    </body>
+    </body>
+    <body name="side_stem4" pos="0.000 0.000 0.323">
+    <geom type="capsule" fromto="0.000 0.000 0.000 -0.023 0.000 -0.007" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="-0.023 0.000 -0.007 -0.040 0.000 -0.026" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="-0.040 0.000 -0.026 -0.057 0.000 -0.047" size="0.0025" rgba="0 0.6 0 1"/>
+    <!-- side_stem4 tip=(-0.057,0.000,-0.047) -->
+    <body name="truss4" pos="-0.057 0.000 -0.047">
+    <!-- truss: 4 tomatoes, span=0.029 m from tip -->
+    <geom type="capsule" fromto="0.000 0.000 0.000 -0.001 -0.008 -0.025" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.001 -0.008 -0.027" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.010 0.000 0.000 0.012 -0.009 -0.031" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.012 -0.009 -0.034" size="0.022" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.019 0.000 0.000 0.018 -0.003 -0.034" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.018 -0.003 -0.037" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="0.029 0.000 0.000 0.027 0.010 -0.021" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="0.027 0.010 -0.023" size="0.021" rgba="1 0 0 1"/>
+    </body>
+    </body>
+    <body name="side_stem5" pos="0.000 0.000 0.370">
+    <geom type="capsule" fromto="0.000 0.000 0.000 0.022 0.000 -0.006" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="0.022 0.000 -0.006 0.039 0.000 -0.023" size="0.0025" rgba="0 0.6 0 1"/>
+    <geom type="capsule" fromto="0.039 0.000 -0.023 0.056 0.000 -0.042" size="0.0025" rgba="0 0.6 0 1"/>
+    <!-- side_stem5 tip=(0.056,0.000,-0.042) -->
+    <body name="truss5" pos="0.056 0.000 -0.042">
+    <!-- truss: 7 tomatoes, span=0.033 m from tip -->
+    <geom type="capsule" fromto="-0.000 0.000 0.000 -0.001 -0.004 -0.018" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.001 -0.004 -0.022" size="0.021" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.006 0.000 0.000 -0.004 -0.007 -0.020" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.004 -0.007 -0.022" size="0.023" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.011 0.000 0.000 -0.010 0.006 -0.018" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.010 0.006 -0.021" size="0.021" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.017 0.000 0.000 -0.015 0.010 -0.022" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.015 0.010 -0.024" size="0.018" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.022 0.000 0.000 -0.025 0.007 -0.022" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.025 0.007 -0.025" size="0.022" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.028 0.000 0.000 -0.029 0.005 -0.019" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.029 0.005 -0.023" size="0.019" rgba="1 0 0 1"/>
+    <geom type="capsule" fromto="-0.033 0.000 0.000 -0.033 0.003 -0.034" size="0.0012" rgba="0 0.6 0 1"/>
+    <geom type="sphere" pos="-0.033 0.003 -0.036" size="0.023" rgba="1 0 0 1"/>
+    </body>
+    </body>
+    </body>
+      </worldbody>
+</mujoco>

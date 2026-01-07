@@ -25,6 +25,8 @@ from absl import app, flags, logging
 import gym
 import jax
 import jax.numpy as jnp
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
 import numpy as np
 import wandb
 
@@ -63,6 +65,94 @@ def sample_mc_actions(model, obs, task, n_samples=10, base_rng=None):
     return actions
 
 
+def make_env(model):
+    env = gym.make("aloha-sim-cube-v0")
+    env = NormalizeProprio(env, model.dataset_statistics)
+    env = HistoryWrapper(env, horizon=1)
+    env = RHCWrapper(env, exec_horizon=50)
+    return env
+
+
+def apply_occlusion(image, fraction=0.3):
+    img = np.array(image)
+    if img.ndim < 3:
+        return image
+    h = img.shape[-3]
+    w = img.shape[-2]
+    occ_h = max(1, int(h * fraction))
+    occ_w = max(1, int(w * fraction))
+    y0 = (h - occ_h) // 2
+    x0 = (w - occ_w) // 2
+    if img.ndim == 3:
+        img[y0:y0 + occ_h, x0:x0 + occ_w, :] = 0
+    else:
+        img[..., y0:y0 + occ_h, x0:x0 + occ_w, :] = 0
+    return img
+
+
+def run_condition(model, condition_name, occlude=False, n_episodes=3):
+    env = make_env(model)
+    episode_returns = []
+    episode_uncertainties = []
+    saved_snapshot = False
+
+    for i in range(n_episodes):
+        obs, info = env.reset()
+
+        language_instruction = env.get_task()["language_instruction"]
+        task = model.create_tasks(texts=language_instruction)
+
+        images = [obs["image_primary"][0]]
+        episode_return = 0.0
+        step_uncertainties = []
+        while len(images) < 400:
+            mc_actions = sample_mc_actions(
+                model,
+                obs,
+                task,
+                n_samples=10,
+                base_rng=jax.random.PRNGKey(np.random.randint(1e6)),
+            )
+            action_mean = jnp.mean(mc_actions, axis=0)
+            action_std = jnp.std(mc_actions, axis=0)
+            actions = np.array(action_mean)
+            step_uncertainties.append(float(jnp.mean(action_std)))
+
+            obs, reward, done, trunc, info = env.step(actions)
+            if occlude:
+                obs["image_primary"] = jnp.array(apply_occlusion(obs["image_primary"]))
+                if not saved_snapshot:
+                    snapshot = np.array(obs["image_primary"])
+                    if snapshot.ndim == 4:
+                        snapshot = snapshot[0]
+                    imageio.imwrite("occlusion_snapshot.png", snapshot)
+                    saved_snapshot = True
+
+            images.extend([o["image_primary"][0] for o in info["observations"]])
+            episode_return += reward
+            if done or trunc:
+                break
+
+        avg_uncertainty = float(np.mean(step_uncertainties)) if step_uncertainties else 0.0
+        episode_returns.append(episode_return)
+        episode_uncertainties.append(avg_uncertainty)
+        print(f"{condition_name} Episode return: {episode_return}")
+
+        with open("eval_mc_uncertainty_metrics.txt", "a") as f:
+            f.write(f"{condition_name} Episode {i+1}:\n")
+            f.write(f"  Return: {episode_return:.2f}\n")
+            f.write(f"  Avg Action Std (Uncertainty): {avg_uncertainty:.4f}\n")
+            f.write("\n")
+
+        wandb.log({
+            f"{condition_name}_rollout_video": wandb.Video(
+                np.array(images).transpose(0, 3, 1, 2)[::2]
+            ),
+            f"{condition_name}_avg_action_std": avg_uncertainty,
+        })
+
+    return episode_returns, episode_uncertainties
+
 
 
 def main(_):
@@ -73,29 +163,6 @@ def main(_):
     logging.info("Loading finetuned model...")
     model = OctoModel.load_pretrained(FLAGS.finetuned_path)
 
-    # make gym environment
-    ##################################################################################################################
-    # environment needs to implement standard gym interface + return observations of the following form:
-    #   obs = {
-    #     "image_primary": ...
-    #   }
-    # it should also implement an env.get_task() function that returns a task dict with goal and/or language instruct.
-    #   task = {
-    #     "language_instruction": "some string"
-    #     "goal": {
-    #       "image_primary": ...
-    #     }
-    #   }
-    ##################################################################################################################
-    env = gym.make("aloha-sim-cube-v0")
-
-    # wrap env to normalize proprio
-    env = NormalizeProprio(env, model.dataset_statistics)
-
-    # add wrappers for history and "receding horizon control", i.e. action chunking
-    env = HistoryWrapper(env, horizon=1)
-    env = RHCWrapper(env, exec_horizon=50)
-
     # the supply_rng wrapper supplies a new random key to sample_actions every time it's called
     policy_fn = supply_rng(
         partial(
@@ -104,51 +171,26 @@ def main(_):
         ),
     )
 
-    # running rollouts
-    for i in range(3):
-        obs, info = env.reset()
+    normal_returns, normal_uncertainties = run_condition(
+        model, "normal", occlude=False, n_episodes=10
+    )
+    occlusion_returns, occlusion_uncertainties = run_condition(
+        model, "occlusion", occlude=True, n_episodes=10
+    )
 
-        # create task specification --> use model utility to create task dict with correct entries
-        language_instruction = env.get_task()["language_instruction"]
-        task = model.create_tasks(texts=language_instruction)
-
-        # run rollout for 400 steps
-        images = [obs["image_primary"][0]]
-        episode_return = 0.0
-        while len(images) < 400:
-            # model returns actions of shape [batch, pred_horizon, action_dim] -- remove batch
-            mc_actions = sample_mc_actions(model, obs, task, n_samples=10, base_rng=jax.random.PRNGKey(np.random.randint(1e6)))
-            action_mean = jnp.mean(mc_actions, axis=0)
-            action_std = jnp.std(mc_actions, axis=0)  # Optional: for visualization or thresholds
-            actions = np.array(action_mean)
-
-
-            # step env -- info contains full "chunk" of observations for logging
-            # obs only contains observation for final step of chunk
-            obs, reward, done, trunc, info = env.step(actions)
-            obs["image_primary"] = obs["image_primary"] * 0.9
-
-            images.extend([o["image_primary"][0] for o in info["observations"]])
-            episode_return += reward
-            if done or trunc:
-                break
-        print(f"Episode return: {episode_return}")
-
-        # Save MC Dropout metrics to a file
-        with open("eval_mc_uncertainty_metrics.txt", "a") as f:
-            f.write(f"Episode {i+1}:\n")
-            f.write(f"  Return: {episode_return:.2f}\n")
-            f.write(f"  Avg Action Std (Uncertainty): {float(jnp.mean(action_std)):.4f}\n")
-            f.write(f"  Max Action Std: {float(jnp.max(action_std)):.4f}\n")
-            f.write(f"  Min Action Std: {float(jnp.min(action_std)):.4f}\n")
-            f.write(f"  Action Std Shape: {action_std.shape}\n")
-            f.write("\n")
-
-        # log rollout video to wandb -- subsample temporally 2x for faster logging
-        wandb.log({
-            "rollout_video": wandb.Video(np.array(images).transpose(0, 3, 1, 2)[::2]),
-            "avg_action_std": float(jnp.mean(action_std))
-        })
+    episodes = np.arange(1, len(normal_uncertainties) + 1)
+    plt.figure(figsize=(8, 4))
+    plt.scatter(episodes, normal_uncertainties, label="Normal")
+    plt.scatter(episodes, occlusion_uncertainties, label="Occluded")
+    plt.xlabel("Episode")
+    plt.ylabel("Avg Action Std (Uncertainty)")
+    plt.title("MC Dropout Uncertainty: Normal vs Occluded")
+    plt.xticks(episodes)
+    plt.ylim(bottom=0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("mc_uncertainty_comparison.png")
+    plt.close()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,176 @@
+normal Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0033
+
+normal Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0029
+
+normal Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+blur Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0034
+
+blur Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+blur Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0033
+
+normal Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+blur Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0033
+
+blur Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+blur Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0034
+
+normal Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+blur Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0033
+
+blur Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0029
+
+blur Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0029
+
+normal Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0035
+
+normal Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+occlusion Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0044
+
+occlusion Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0045
+
+occlusion Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0046
+
+normal Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0034
+
+normal Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0030
+
+normal Episode 4:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0029
+
+normal Episode 5:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0041
+
+normal Episode 6:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0040
+
+normal Episode 7:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0036
+
+normal Episode 8:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0034
+
+normal Episode 9:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0041
+
+normal Episode 10:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0034
+
+occlusion Episode 1:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0043
+
+occlusion Episode 2:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0045
+
+occlusion Episode 3:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0044
+
+occlusion Episode 4:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0045
+
+occlusion Episode 5:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0046
+
+occlusion Episode 6:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0046
+
+occlusion Episode 7:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0047
+
+occlusion Episode 8:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0045
+
+occlusion Episode 9:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0045
+
+occlusion Episode 10:
+  Return: 0.00
+  Avg Action Std (Uncertainty): 0.0047
+

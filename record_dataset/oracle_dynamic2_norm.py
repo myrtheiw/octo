@@ -167,12 +167,12 @@ TYPICAL_FRANKA_LIMITS = [
 
 # Plant & dataset settings
 USE_DYNAMIC_PLANT  = True     # regenerate plant geometry every couple episodes
-EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 100))
+EPISODES_TOTAL     = int(os.environ.get("EPISODES_TOTAL", 120))
 EPISODES_PER_PLANT = 2        # top-2 stems per plant, then regenerate
 
 TFDS_ROOT_DIR   = os.environ.get("TFDS_ROOT_DIR", "/home/myrtheiw/tfds_out")
 DATASET_NAME    = os.environ.get("DATASET_NAME", "tomato_rlds")
-DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.40")
+DATASET_VERSION = os.environ.get("DATASET_VERSION", "0.0.43")
 
 _DEFAULT_GOAL_IMAGE_OUTPUT_DIR = (
     Path(__file__).resolve().parents[1] / "outputs" / "goal_images"
@@ -191,14 +191,6 @@ def _ensure_goal_dir_exists():
         print(f"[GOAL_IMG] unable to create directory '{GOAL_IMAGE_OUTPUT_DIR}': {exc}")
         return False
 
-def _normalize_delta(delta: np.ndarray) -> np.ndarray:
-    """
-    Normalize a raw joint delta Δq (radians) into approx [-1, 1] using JOINT_DELTA_SCALE.
-    """
-    delta = np.asarray(delta, dtype=np.float32).reshape(7)
-    scaled = delta / JOINT_DELTA_SCALE
-    # Hard clamp to Octo-style range
-    return np.clip(scaled, -1.0, 1.0).astype(np.float32, copy=False)
 
 
 def _write_goal_image(path: str, image: np.ndarray) -> None:
@@ -235,7 +227,7 @@ SPLIT_RATIOS = dict(train=0.90, val=0.10, test=0.0)
 DATASET_ACTION_SCALE = 1.0   # action labels store Δq / scale; match this with --dataset_action_scale during replay
 DATASET_MIN_STEP_NORM = 1e-3   # drop frames whose joint delta is below this (radians)
 DATASET_FINAL_HOLD_STEPS = 10  # small hold appended after deduplication for stability
-DATASET_MAX_STEP_RAD = 2.0e-2  # clamp per-step joint deltas by inserting interpolated waypoints
+DATASET_MAX_STEP_RAD = 0.05  # clamp per-step joint deltas by inserting interpolated waypoints
 JOINT_DELTA_SCALE = np.full(7, DATASET_MAX_STEP_RAD, dtype=np.float32)
 
 class ActionDeltaStatistics:
@@ -1076,6 +1068,18 @@ class PandaOracleEnv(dm_env.Environment):
 
     # --- modify step() to consume policy actions when control_mode == "policy" ---
     def step(self, action):
+        # --- CHANGE THIS BLOCK ---
+        # 1. We expect 'action' to be RAW joint deltas (radians).
+        # 2. We flatten it and remove gripper dims if present.
+        val = np.asarray(action, dtype=np.float32).reshape(-1)
+        if val.shape[0] > 7: 
+            val = val[:7] 
+        
+        # 3. Apply the delta directly. 
+        # Since DATASET_ACTION_SCALE is 1.0, we don't need to divide/multiply here.
+        q_target = self.data.qpos[self.arm_qpos_addr] + val
+        q_target = self._clamp_to_limits(q_target)
+
         if self.control_mode == "waypoints":
             if self._waypoints is None or self._T == 0:
                 raise RuntimeError("step() in waypoints mode before reset(waypoints=...)")
@@ -1120,13 +1124,14 @@ class PandaOracleEnv(dm_env.Environment):
 
         # Common PD inner loop
         for _ in range(self.substeps):
-            q  = self.data.qpos[self.arm_qpos_addr].copy()
-            qd = self.data.qvel[self.arm_dof_idx].copy()
-            e  = q_target - q
-            u  = self.kp * e - self.kd * qd
-            self.data.ctrl[self.arm_act_ids] = u
+            # FIX: Send Target Position directly. 
+            # The XML's implicit actuator handles the Force/Torque calculation.
+            self.data.ctrl[self.arm_act_ids] = q_target
+            
+            # Gripper logic remains the same (it was already sending position)
             if 0 <= self.gripper_idx < self.model.nu:
                 self.data.ctrl[self.gripper_idx] = g_cmd
+                
             mujoco.mj_step(self.model, self.data)
 
         self._t += 1
@@ -1310,20 +1315,11 @@ def run_oracle_once(
 ):
     """
     Plans and executes an oracle trajectory toward goal_pos.
-
-    Builds a realistic waypoint sequence with:
-      - Time-parameterized motion (EE limits)
-      - Human-like pauses (pre-grasp, close, post-grasp/place, final)
-      - Gripper ramp & hold
-      - Optional micro-centering + wrist roll during grasp
-
-    Returns:
-        (err_final: float, waypoints: np.ndarray [N, 8], goal_frame_idx: int)
+    Fixes Segfault by launching viewer OUTSIDE the step loop.
     """
 
     # ---- Reset state ----
     data.qpos[arm_qpos_addr] = START_JOINTS
-
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
     q_start = data.qpos[arm_qpos_addr].copy()
@@ -1398,15 +1394,13 @@ def run_oracle_once(
             traj_q_rep[end_goal+1:end_ret+1],
         ], axis=0)
 
-        # ---- Wrist roll ramp during the GOAL dwell (restore old behavior) ----
-        # Figure out where the dwell_goal sits inside traj_q_full
+        # ---- Wrist roll ramp during the GOAL dwell ----
         len_pre      = len(traj_q_rep[:end_pre+1])
         len_dpre     = len(dwell_pre)
         len_to_goal  = len(traj_q_rep[end_pre+1:end_goal+1])
         idx_dwell_goal_start = len_pre + len_dpre + len_to_goal
         idx_dwell_goal_end   = idx_dwell_goal_start + len(dwell_goal)
 
-        # Ramp the 7th joint (index 6) over the tail of that dwell
         j_roll = 6
         i1 = int(idx_dwell_goal_end)
         i0 = int(max(idx_dwell_goal_start, i1 - int(ROLL_RAMP_STEPS)))
@@ -1420,13 +1414,11 @@ def run_oracle_once(
             print(f"[WRIST] roll ramp: {HAND_ROLL_AT_GRASP_DEG:.1f}° over {steps} steps")
         else:
             print("[WRIST] (skipped) dwell too short for roll ramp")
-        # ---- End wrist roll ramp ----
 
         # 5. Distance-based timing for gripper closure
         _bak = data.qpos.copy()
         dists = []
         for q in traj_q_full:
-            # joints only
             data.qpos[arm_qpos_addr] = q[:7]
             mujoco.mj_forward(model, data)
             ee, _ = _ee_pose(model, data, ee_ref)
@@ -1438,7 +1430,6 @@ def run_oracle_once(
         close_start = max(end_goal + MIN_CLOSE_IDX_MARGIN, idx_close)
         close_start = min(close_start, len(traj_q_full) - 1)
 
-        # Insert dwell for gripper close
         dwell_close = np.repeat(traj_q_full[close_start:close_start+1],
                                 repeats=dwell_close_steps, axis=0)
         traj_q_full = np.concatenate([
@@ -1454,7 +1445,7 @@ def run_oracle_once(
             np.repeat(traj_q_full[-1][None, :], repeats=dwell_final_hold, axis=0),
         ], axis=0)
 
-        # 7. Gripper ramp (after final length known)
+        # 7. Gripper ramp
         N_hold = len(traj_q_hold)
         close_start = int(np.clip(close_start, 0, N_hold - 1))
         end_ramp = int(min(close_start + GRIPPER_RAMP_STEPS, N_hold))
@@ -1494,31 +1485,19 @@ def run_oracle_once(
     # ----------------------------------------------------------------------
     N = len(waypoints)
     t_idx = 0
-
-    prev_control_mode = getattr(base_env, "control_mode", "waypoints")
     base_env.control_mode = "policy"
 
+    # Helper to advance 1 step
     def _step_once(stepper):
-        """Advance one 10Hz step by commanding the delta from CURRENT q to the NEXT waypoint.
-        This prevents drift from accumulating if PD tracking didn't fully reach the previous target."""
         nonlocal t_idx
-        if N == 0:
-            return True
+        if N == 0: return True
 
-        idx_cur  = min(t_idx,     N - 1)
         idx_next = min(t_idx + 1, N - 1)
-
-        # NEXT waypoint we want to reach
         next_row = waypoints[idx_next]
-
-        # Current joints from sim (what we actually reached)
         q_now = base_env.data.qpos[arm_qpos_addr].copy()
 
-        # ACTION = joint delta from CURRENT to NEXT (joint_delta semantics)
-        # Keep DATASET_ACTION_SCALE = 1.0 so this is "true radians".
+        # ACTION = joint delta from CURRENT to NEXT (raw radians)
         a_label = (next_row[:7] - q_now[:7]).astype(np.float32)
-
-        # Optional: cap per-step delta (aligned with DATASET_MAX_STEP_RAD)
         max_step = float(DATASET_MAX_STEP_RAD)
         if max_step > 0.0:
             a_label = np.clip(a_label, -max_step, max_step)
@@ -1534,15 +1513,19 @@ def run_oracle_once(
             base_env.set_capture_images(LIVE_RENDER_QC)
 
         base_env.set_waypoints(waypoints)
-        base_env.reset(waypoints=waypoints)  # seed renderer if any
+        base_env.reset(waypoints=waypoints)
+
+        # Viewer logic for dry run (Fixed segfault risk here too)
+        qc_viewer = None
+        if LIVE_RENDER_QC:
+             qc_viewer = viewer.launch_passive(model, data)
 
         try:
-            if LIVE_RENDER_QC:
-                # simple ~10 Hz live preview of the planned waypoints
+            if LIVE_RENDER_QC and qc_viewer is not None:
                 period = float(max(TARGET_ACTION_DT, 1e-3))
                 t0 = time.time()
-                # step through the whole plan once
                 while not _step_once(base_env.step):
+                    qc_viewer.sync()
                     t0 += period
                     time.sleep(max(0.0, t0 - time.time()))
             else:
@@ -1550,7 +1533,6 @@ def run_oracle_once(
                 data.qpos[arm_qpos_addr] = waypoints[-1, :7]
                 mujoco.mj_forward(model, data)
 
-            # Evaluate final pose error and return
             ee_pos, _ = _ee_pose(model, data, ee_ref)
             err_final = float(np.linalg.norm(goal_pos - ee_pos))
             print(f"[QC] final |EE - goal| = {err_final:.4f} m")
@@ -1558,71 +1540,61 @@ def run_oracle_once(
         finally:
             if hasattr(base_env, "set_capture_images"):
                 base_env.set_capture_images(prev_cap)
+            if qc_viewer is not None:
+                qc_viewer.close()
 
     # --- LOGGED RUN (executed-delta logging) ---
     if env is None:
-        raise RuntimeError("Logged run requested but `env` is None. Use dry_run=True for QC or pass an EnvLogger.")
+        raise RuntimeError("Logged run requested but `env` is None.")
 
-
-    # EXECUTE with waypoints (PD ignores the action argument),
-    # LOG the *executed* Δq from proprio (normalized).
+    # 1. Reset everything
     base_env.set_waypoints(waypoints)
-    base_env.control_mode = "waypoints"
     base_env.reset(waypoints=waypoints)
+    env.reset() # Logs first observation
 
-    # 1) PRIME STEP (no logging yet)
-    q_prev = base_env.data.qpos[arm_qpos_addr].copy()
-    _ = base_env.step(action=np.zeros(7, dtype=np.float32))  # ignored in 'waypoints' mode
-    q_now  = base_env.data.qpos[arm_qpos_addr].copy()
-    a_exec_prev = (q_now[:7] - q_prev[:7]).astype(np.float32)
-
-    # Start EnvLogger from this state
-    env.reset()
-
-    # Optional live view
+    # 2. Setup Viewer ONCE (Fixes Segfault)
+    log_viewer = None
     if LIVE_RENDER:
-        period = 1.0 / float(LIVE_FPS)
-        with viewer.launch_passive(model, data) as v:
-            last_t = time.perf_counter()
-            done = False
-            while v.is_running() and not done:
-                # 2) Log raw Δq stats and send normalized Δq to the logger
-                if action_delta_stats is not None:
-                    action_delta_stats.observe(a_exec_prev)          # raw radians
-                a_log_prev = _normalize_delta(a_exec_prev)           # normalized [-1, 1]
-                done = env.step(a_log_prev).last()
+        log_viewer = viewer.launch_passive(model, data)
 
-                # 3) Measure executed Δq for NEXT transition
-                q_next_prev = q_now.copy()
-                q_now = base_env.data.qpos[arm_qpos_addr].copy()
-                a_exec_prev = (q_now[:7] - q_next_prev[:7]).astype(np.float32)
+    try:
+        # 3. Iterate through waypoints
+        for i in range(len(waypoints) - 1):
+            
+            # Current state
+            q_now = data.qpos[arm_qpos_addr].copy()
+            
+            # Target state (Next waypoint)
+            q_target = waypoints[i + 1, :7]
 
-                # pacing + viewer sync
-                now = time.perf_counter()
-                if now - last_t < period:
-                    time.sleep(max(0.0, period - (now - last_t)))
-                last_t = now
-                v.sync()
-    else:
-        done = False
-        while not done:
-            # Log + step exactly once per outer step
+            # CALCULATE ACTION: The delta needed to get from NOW to NEXT
+            action_raw = (q_target - q_now).astype(np.float32)
+
+            # Safety clamp
+            action_raw = np.clip(action_raw, -DATASET_MAX_STEP_RAD, DATASET_MAX_STEP_RAD)
+
+            # Accumulate Stats
             if action_delta_stats is not None:
-                action_delta_stats.observe(a_exec_prev)          # raw radians
-            a_log_prev = _normalize_delta(a_exec_prev)           # normalized [-1, 1]
-            done = env.step(a_log_prev).last()
+                action_delta_stats.observe(action_raw)
 
-            # Measure executed Δq for the NEXT step
-            q_next_prev = q_now.copy()
-            q_now = base_env.data.qpos[arm_qpos_addr].copy()
-            a_exec_prev = (q_now[:7] - q_next_prev[:7]).astype(np.float32)
-    # Done; report final error
+            # Step Env
+            env.step(action_raw)
+            
+            # Sync Viewer (Reusing the single window)
+            if log_viewer is not None:
+                log_viewer.sync()
+                time.sleep(0.002)
+
+    finally:
+        # Close viewer when done
+        if log_viewer is not None:
+            log_viewer.close()
+
+    # 4. Report Final Error
     ee_pos, _ = _ee_pose(model, data, ee_ref)
     err_final = float(np.linalg.norm(goal_pos - ee_pos))
     print(f"[RUN] final |EE - goal| = {err_final:.4f} m")
     return err_final, waypoints, goal_frame_idx
-
-
 # ----------------------------------- Main -------------------------------------
 
 def _site_exists(model, name: str) -> bool:
@@ -1640,8 +1612,22 @@ def main():
         try:
             # --------- Build / reset plant ---------
             if USE_DYNAMIC_PLANT:
-                model, data = _build_and_load_scene(MODEL_PATH)
-                print(f"[SPLIT] (dynamic plant; split chosen per-episode)")
+                # === NEW: RANDOMIZE PLANT LOCATION ===
+                # Robot base is at (0,0,0).
+                # X: Distance. 0.35 is very close, 0.65 is max reach.
+                # Y: Lateral. -0.2 is right, +0.2 is left.
+                plant_x = rng.uniform(0.40, 0.60) 
+                plant_y = rng.uniform(-0.25, 0.25)
+                plant_z = 0.15  # Keep Z fixed (height of pot on table)
+                
+                print(f"[PLANT] Spawning at X={plant_x:.2f}, Y={plant_y:.2f}")
+
+                # Pass the new random base to the helper
+                model, data = _build_and_load_scene(
+                    MODEL_PATH, 
+                    plant_base=(plant_x, plant_y, plant_z)
+                )
+                print(f"[SPLIT] (dynamic plant; split chosen per-episode)")        
             else:
                 model = mujoco.MjModel.from_xml_path(MODEL_PATH)
                 data  = mujoco.MjData(model)
@@ -1788,7 +1774,7 @@ def main():
                                 "action_type": "joint_delta",
                                 "action_scale": base_env.action_scale,  # <<< record it
                                 "action_dt_sec": float(TARGET_ACTION_DT),
-                                # "success":True,
+                                "success":True,
                             },
                     ) as env:
                         run_oracle_once(

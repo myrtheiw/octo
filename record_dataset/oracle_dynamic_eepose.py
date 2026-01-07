@@ -238,6 +238,41 @@ DATASET_FINAL_HOLD_STEPS = 10  # small hold appended after deduplication for sta
 DATASET_MAX_STEP_RAD = 2.0e-2  # clamp per-step joint deltas by inserting interpolated waypoints
 JOINT_DELTA_SCALE = np.full(7, DATASET_MAX_STEP_RAD, dtype=np.float32)
 
+# --------------------- Action representation (EE deltas) ----------------------
+
+# EE action: [dx, dy, dz, dyaw]
+EE_ACTION_DIM = 4
+
+# Rough max per-step movement that should map to |a| ~= 1.0 after normalization.
+# Tune if you see saturation or tiny effective actions.
+EE_TRANS_SCALE = np.array([0.02, 0.02, 0.02], dtype=np.float32)  # 2 cm per step
+EE_YAW_SCALE   = np.deg2rad(10.0)                                # 10 deg per step
+
+def _ee_pos_yaw(model, data, ee_ref):
+    """Return (pos[3], yaw) for the end-effector."""
+    pos, R = _ee_pose(model, data, ee_ref)  # existing helper → pos, 3x3 rot matrix
+    # Simple yaw extraction from rotation matrix (Z-rotation)
+    yaw = float(np.arctan2(R[1, 0], R[0, 0]))
+    return pos.astype(np.float32), np.float32(yaw)
+
+def _ee_delta(prev_pos, prev_yaw, cur_pos, cur_yaw):
+    """Delta EE in world frame: [dx, dy, dz, dyaw] (raw, un-normalized)."""
+    dpos = np.asarray(cur_pos, dtype=np.float32) - np.asarray(prev_pos, dtype=np.float32)
+    dyaw = float(cur_yaw - prev_yaw)
+    # Wrap to [-pi, pi] to avoid jumps
+    dyaw = (dyaw + np.pi) % (2.0 * np.pi) - np.pi
+    return np.concatenate([dpos, np.array([dyaw], dtype=np.float32)], axis=0)
+
+def _normalize_ee_delta(delta: np.ndarray) -> np.ndarray:
+    """
+    Normalize raw EE delta [dx,dy,dz,dyaw] into approx [-1, 1].
+    """
+    delta = np.asarray(delta, dtype=np.float32).reshape(EE_ACTION_DIM)
+    out = delta.copy()
+    out[:3] /= EE_TRANS_SCALE
+    out[3]  /= EE_YAW_SCALE
+    return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
+
 class ActionDeltaStatistics:
     """Accumulates raw Δq statistics for Octo-compatible normalization metadata."""
 
@@ -1157,7 +1192,9 @@ class PandaOracleEnv(dm_env.Environment):
         }
 
     def action_spec(self):
-        return specs.Array(shape=(7,), dtype=np.float32, name="action")
+        # OLD: return specs.Array(shape=(7,), dtype=np.float32, name="action")
+        return specs.Array(shape=(EE_ACTION_DIM,), dtype=np.float32, name="action")
+
 
 # ------------------------------ Rollout & Logging -----------------------------
 
@@ -1565,16 +1602,16 @@ def run_oracle_once(
 
 
     # EXECUTE with waypoints (PD ignores the action argument),
-    # LOG the *executed* Δq from proprio (normalized).
+    # LOG the *executed* EE delta from proprio (normalized).
     base_env.set_waypoints(waypoints)
     base_env.control_mode = "waypoints"
     base_env.reset(waypoints=waypoints)
 
     # 1) PRIME STEP (no logging yet)
-    q_prev = base_env.data.qpos[arm_qpos_addr].copy()
-    _ = base_env.step(action=np.zeros(7, dtype=np.float32))  # ignored in 'waypoints' mode
-    q_now  = base_env.data.qpos[arm_qpos_addr].copy()
-    a_exec_prev = (q_now[:7] - q_prev[:7]).astype(np.float32)
+    prev_pos, prev_yaw = _ee_pos_yaw(model, data, ee_ref)
+    _ = base_env.step(action=np.zeros(EE_ACTION_DIM, dtype=np.float32))  # ignored in 'waypoints' mode
+    cur_pos, cur_yaw = _ee_pos_yaw(model, data, ee_ref)
+    a_exec_prev = _ee_delta(prev_pos, prev_yaw, cur_pos, cur_yaw)
 
     # Start EnvLogger from this state
     env.reset()
@@ -1586,16 +1623,16 @@ def run_oracle_once(
             last_t = time.perf_counter()
             done = False
             while v.is_running() and not done:
-                # 2) Log raw Δq stats and send normalized Δq to the logger
+                # 2) Log raw EE stats and send normalized EE delta to the logger
                 if action_delta_stats is not None:
-                    action_delta_stats.observe(a_exec_prev)          # raw radians
-                a_log_prev = _normalize_delta(a_exec_prev)           # normalized [-1, 1]
+                    action_delta_stats.observe(a_exec_prev)  # raw EE units
+                a_log_prev = _normalize_ee_delta(a_exec_prev)  # normalized [-1, 1]
                 done = env.step(a_log_prev).last()
 
-                # 3) Measure executed Δq for NEXT transition
-                q_next_prev = q_now.copy()
-                q_now = base_env.data.qpos[arm_qpos_addr].copy()
-                a_exec_prev = (q_now[:7] - q_next_prev[:7]).astype(np.float32)
+                # 3) Measure executed EE delta for NEXT transition
+                prev_pos, prev_yaw = cur_pos, cur_yaw
+                cur_pos, cur_yaw = _ee_pos_yaw(model, data, ee_ref)
+                a_exec_prev = _ee_delta(prev_pos, prev_yaw, cur_pos, cur_yaw)
 
                 # pacing + viewer sync
                 now = time.perf_counter()
@@ -1606,17 +1643,16 @@ def run_oracle_once(
     else:
         done = False
         while not done:
-            # Log + step exactly once per outer step
             if action_delta_stats is not None:
-                action_delta_stats.observe(a_exec_prev)          # raw radians
-            a_log_prev = _normalize_delta(a_exec_prev)           # normalized [-1, 1]
+                action_delta_stats.observe(a_exec_prev)
+            a_log_prev = _normalize_ee_delta(a_exec_prev)
             done = env.step(a_log_prev).last()
 
-            # Measure executed Δq for the NEXT step
-            q_next_prev = q_now.copy()
-            q_now = base_env.data.qpos[arm_qpos_addr].copy()
-            a_exec_prev = (q_now[:7] - q_next_prev[:7]).astype(np.float32)
-    # Done; report final error
+            prev_pos, prev_yaw = cur_pos, cur_yaw
+            cur_pos, cur_yaw = _ee_pos_yaw(model, data, ee_ref)
+            a_exec_prev = _ee_delta(prev_pos, prev_yaw, cur_pos, cur_yaw)
+
+    # Done; report final error (unchanged)
     ee_pos, _ = _ee_pose(model, data, ee_ref)
     err_final = float(np.linalg.norm(goal_pos - ee_pos))
     print(f"[RUN] final |EE - goal| = {err_final:.4f} m")
@@ -1631,7 +1667,7 @@ def _site_exists(model, name: str) -> bool:
 def main():
     os.makedirs(TFDS_ROOT_DIR, exist_ok=True)
     rng = np.random.default_rng(0)
-    action_delta_stats = ActionDeltaStatistics(action_dim=7)
+    action_delta_stats = ActionDeltaStatistics(action_dim=EE_ACTION_DIM)
 
     episodes_done = 0
     plant_idx = 0
@@ -1678,7 +1714,8 @@ def main():
                     "goal_image_primary": tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
                     "goal_image_wrist":   tfds.features.Image(shape=(IMG_H, IMG_W, 3), encoding_format="jpeg"),
                 }),
-                action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),
+                # OLD: action_info=tfds.features.Tensor(shape=(7,), dtype=np.float32),
+                action_info=tfds.features.Tensor(shape=(EE_ACTION_DIM,), dtype=np.float32),
                 reward_info=tf.float32,
                 discount_info=tf.float32,
             )
@@ -1783,13 +1820,16 @@ def main():
                             max_episodes_per_file=8,
                             ds_config=ds_config,
                         ),
-                            metadata={
-                                "language_instruction": base_env.lang,
-                                "action_type": "joint_delta",
-                                "action_scale": base_env.action_scale,  # <<< record it
-                                "action_dt_sec": float(TARGET_ACTION_DT),
-                                # "success":True,
+                        metadata={
+                            "language_instruction": base_env.lang,
+                            "action_type": "ee_delta_pos_yaw",
+                            "action_scale": {
+                                "trans": EE_TRANS_SCALE.tolist(),
+                                "yaw": float(EE_YAW_SCALE),
                             },
+                            "action_dt_sec": float(TARGET_ACTION_DT),
+                        },
+
                     ) as env:
                         run_oracle_once(
                             env=env, base_env=base_env, model=model, data=data,
