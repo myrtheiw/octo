@@ -7,6 +7,8 @@ import gym
 import numpy as np
 from PIL import Image
 
+DEBUG_TERM = True
+
 try:
     import dm_env
 except Exception: 
@@ -43,6 +45,7 @@ class PandaTomatoSimEnv:
         self.current_instruction = "pick the ripe tomato"
         self.current_goal_primary = None
         self.current_goal_wrist = None
+        self._dbg_term_obs_count = 0
 
     def _build_env(self):
         model = mujoco.MjModel.from_xml_path(self.model_xml)
@@ -66,14 +69,33 @@ class PandaTomatoSimEnv:
     def step(self, action):
         ts = self._env.step(action)
         done = (ts.step_type == dm_env.StepType.LAST)
-        return self._timestep_to_obs(ts), float(ts.reward), done, False, {}
+        info = {
+            "is_success": int(ts.observation.get("is_success", 0)),
+            "step_type": ts.step_type,
+        }
+        if DEBUG_TERM and (done or (self._env._t % 20 == 0)):
+            print(
+                f"[TERM WRAP] t={self._env._t} done={done} step_type={ts.step_type} "
+                f"is_success={info['is_success']}",
+                flush=True,
+            )
+        return self._timestep_to_obs(ts), float(ts.reward), done, False, info
 
     def _timestep_to_obs(self, ts):
         obs = ts.observation
+        if DEBUG_TERM:
+            has_success = "is_success" in obs
+            if self._dbg_term_obs_count < 5 or not has_success:
+                self._dbg_term_obs_count += 1
+                print(
+                    f"[TERM WRAP] dm_env is_success_present={has_success}",
+                    flush=True,
+                )
         return {
             "image_primary": np.asarray(obs.get("image_primary")),
             "image_wrist": np.asarray(obs.get("image_wrist")),
             "proprio": np.asarray(obs.get("proprio"), dtype=np.float32),
+            "is_success": np.asarray(obs.get("is_success", 0), dtype=np.int32),
         }
 
     def set_goal_pos(self, goal_pos_world):
@@ -138,6 +160,14 @@ class TomatoGymEnv(gym.Env):
             #getattr(self.panda_env, "expects_absolute_action", False))
 
         obs, reward, done, trunc, info = self.panda_env.step(action)
+        if DEBUG_TERM:
+            should_log = done or trunc or (self._step_counter % 20 == 0)
+            if should_log:
+                print(
+                    f"[TERM GYM] t={self._step_counter} done={done} trunc={trunc} "
+                    f"is_success={info.get('is_success', None)}",
+                    flush=True,
+                )
         
         self._step_counter += 1
         if self._step_counter >= self.max_steps:

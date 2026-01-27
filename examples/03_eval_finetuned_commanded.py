@@ -45,13 +45,11 @@ from record_dataset.helpers import find_side_stem_targets
 # =============================================================================
 # Success/termination: EE-to-goal distance (meters) that counts as success.
 # If this is too large, you may terminate before the gripper ever starts closing.
-SUCCESS_DIST_M = 0.025
+SUCCESS_DIST_M = 0.02
 
 # Gripper closing trigger: start closing when EE is within this distance to goal.
 # Oracle-style default was 0.006 (6mm), but 0.01–0.03 is often more robust.
-GRIPPER_CLOSE_TRIGGER_DIST_M = 0.04
-
-# Gripper ramp duration in outer env steps (oracle default: 25)
+GRIPPER_CLOSE_TRIGGER_DIST_M = 0.024
 GRIPPER_RAMP_STEPS = 25
 
 GRIP_OPEN_NORM = 1.0     # normalized "open"
@@ -59,7 +57,7 @@ GRIP_CLOSE_NORM = 0.0   # normalized "closed"
 
 FREEZE_DIST_M = SUCCESS_DIST_M        # start holding pose when within this distance
 FREEZE_HOLD_STEPS = 20        # hold for N outer env steps once triggered
-POST_SUCCESS_HOLD_STEPS = 50
+POST_SUCCESS_HOLD_STEPS = 20
 EPISODES_PER_PLANT = 2
 # Away-termination tuning: trigger if distance exceeds best-so-far by margin for N steps.
 AWAY_MARGIN_M = 0.05
@@ -477,11 +475,11 @@ class GoalImageObsWrapper(gym.ObservationWrapper):
 # --- OVERRIDE CLASS FOR DIRECT CONTROL ---
 class DirectControlPandaEnv(PandaTomatoSimEnv):
     """
-    Direct-control wrapper that matches the successful replay logic:
+    Direct-control wrapper that matches oracle policy semantics:
 
-    - action is interpreted as a 7D *delta* in "dataset action units"
-    - convert to radians with ORACLE_SCALE (0.02)
-    - integrate into a persistent virtual absolute joint target
+    - action is interpreted as a 7D normalized delta
+    - clamp to [-1, 1], then scale by ORACLE_SCALE to radians
+    - target = measured_qpos + dq (no integrator drift)
     - command the correct actuator indices (arm_act_ids)
     - step multiple MuJoCo substeps per action
     - get_obs returns the same dict layout expected by Octo
@@ -497,12 +495,6 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
         self.model = self._env.model
         self.data  = self._env.data
 
-        # Debug: list all actuators and ctrlranges once at init.
-        for aid in range(self.model.nu):
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, aid) or ""
-            lo, hi = self.model.actuator_ctrlrange[aid]
-            print(f"[ACT] {aid} '{name}' ctrlrange=({float(lo)},{float(hi)})", flush=True)
-
         # 1. FIND GRIPPER ACTUATOR ID
         self.gripper_act_id = find_gripper_actuator(self.model)
 
@@ -514,11 +506,6 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
         # Substeps to match ~0.1s per action
         dt = float(self.model.opt.timestep)
         self.substeps = int(max(1, round(self.TARGET_ACTION_DT / max(dt, 1e-6))))
-        self.max_step_rad = float(DATASET_MAX_STEP_RAD)
-
-        # Persistent integrated target (absolute joint angles)
-        self._q_target = None
-        self._q_cmd = None
 
         self._debug_step_count = 0
         self._step_count = 0
@@ -591,263 +578,251 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
 
 
     def reset(self, **kwargs):
+        # ------------------------------------------------------------------
+        # 0) Episode bookkeeping / termination + success latch state
+        # ------------------------------------------------------------------
         self._success_streak = 0
         self._done_latched = False
         self._success_latched = False
-        self._post_success_hold_left = 0
+
         self._post_success_hold_total = int(POST_SUCCESS_HOLD_STEPS)
+        self._post_success_hold_left = 0
+
         self._step_count = 0
-
-
-
-        # 1. Standard reset (clears physics state)
+        self._dbg_printed = 0
+        self._dbg_dist_post = 0
+        self._debug_step_count = 0
+        
+        # ------------------------------------------------------------------
+        # 1) Standard reset (clears physics state)
+        # ------------------------------------------------------------------
         obs, info = super().reset(**kwargs)
 
-        # 2. FORCE DATASET START POSE
-        # These values match your "Data Joints" debug output exactly
-        start_joints = np.array([
-            0.0, -0.4948, 0.0, -1.5172, 0.0, 1.4902, 0.0
-        ], dtype=np.float64)
-        
-        # Write to physics state directly
+        # ------------------------------------------------------------------
+        # 2) FORCE DATASET START POSE (deterministic)
+        # ------------------------------------------------------------------
+        start_joints = np.array(
+            [0.0, -0.4948, 0.0, -1.5172, 0.0, 1.4902, 0.0],
+            dtype=np.float64,
+        )
         self.data.qpos[self.arm_qpos_adr] = start_joints
-        self.data.qvel[:] = 0  # Kill any momentum
+        self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
 
-        # 3. SYNC CONTROLLER
-        # Tell the P-controller: "Your target is exactly where we just put you"
-        self._q_cmd = start_joints.copy().astype(np.float32)
-        self._q_target = self._q_cmd.copy()
-
-        # 4. RE-CAPTURE OBSERVATION
-        # Use your custom get_obs (which now has the gripper fix)
-        # to ensure the first frame the model sees is correct.
-        obs = self.get_obs()
- 
-        # Reset gripper state machine to OPEN (oracle-style: open until near goal)
-        self._grip_state = "open"
-        self._grip_ramp_step = 0
-        self._grip_norm = GRIP_OPEN_NORM
-        if self.gripper_act_id >= 0:
-            self.data.ctrl[self.gripper_act_id] = self._grip_cmd_from_norm(self._grip_norm)
-
-        return obs, info
-
-    def step(self, action):
-        # --- 0) Parse + validate ---
-        self._step_count += 1
-        a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.shape[0] < 7:
-            raise ValueError(f"Expected action with >=7 dims, got shape {a.shape}")
-
-        # Keep arm dims and clamp to normalized range
-        a7 = np.clip(a[:7], -1.0, 1.0).astype(np.float64, copy=False)
-
-        # --- 1) Convert normalized delta -> radians ---
-        dq_in = a7 * float(self.ORACLE_SCALE)  # radians
-        max_step = float(self.max_step_rad)
-        if max_step > 0.0:
-            dq_in = np.clip(dq_in, -max_step, max_step)
-
-        # --- 2) Build cache: qpos_adr -> joint id (once) ---
+        # ------------------------------------------------------------------
+        # 3) Build cache: qpos_adr -> joint id (once)
+        # ------------------------------------------------------------------
         if not hasattr(self, "_arm_qadr_to_jid"):
             qadr_to_jid = {}
             for jid in range(self.model.njnt):
                 qadr_to_jid[int(self.model.jnt_qposadr[jid])] = jid
             self._arm_qadr_to_jid = qadr_to_jid
 
-        # --- 3) Initialize command-space target (should ideally be set in reset) ---
-        if self._q_cmd is None:
-            self._q_cmd = self.data.qpos[self.arm_qpos_adr].copy().astype(np.float32)
+        # ------------------------------------------------------------------
+        # 4) Sync controller command space
+        # ------------------------------------------------------------------
+        q0 = start_joints.astype(np.float32, copy=False)
+        self._q_cmd = q0.copy()
+        self._q_target = self._q_cmd.copy()
+        self._last_q_target_cmd = q0.copy()
+        self._last_dq_cmd = np.zeros(7, dtype=np.float32)
 
-        # --- 4) If success latched: HOLD (ignore action) ---
-        # We define dq = 0 during hold to make intent explicit.
-        if getattr(self, "_success_latched", False):
-            dq = np.zeros_like(dq_in)
-            # If you stored a hold snapshot, use it; else hold _q_cmd as-is.
-            q_target = getattr(self, "_q_hold", self._q_cmd).astype(np.float64, copy=False)
-        else:
-            dq = dq_in
-            q_meas = self.data.qpos[self.arm_qpos_adr].copy().astype(np.float64)
-            q_cmd = q_meas + dq
+        # ------------------------------------------------------------------
+        # 5) Reset gripper state machine
+        # ------------------------------------------------------------------
+        self._grip_state = "open"
+        self._grip_ramp_step = 0
+        self._grip_norm = float(GRIP_OPEN_NORM)
 
-            # Clamp to joint limits
-            for i, qadr in enumerate(self.arm_qpos_adr):
-                jid = self._arm_qadr_to_jid.get(int(qadr), None)
-                if jid is None:
-                    continue
-                if int(self.model.jnt_limited[jid]) == 1:
-                    lo, hi = self.model.jnt_range[jid]
-                    q_cmd[i] = np.clip(q_cmd[i], lo, hi)
+        if getattr(self, "gripper_act_id", -1) >= 0:
+            try:
+                self.data.ctrl[self.gripper_act_id] = float(
+                    self._grip_cmd_from_norm(self._grip_norm)
+                )
+            except Exception:
+                pass
 
-            # In measured mode we set _q_cmd for logging only.
-            self._q_cmd = q_cmd.astype(np.float32)
-            q_target = q_cmd.astype(np.float64, copy=False)
+        # ------------------------------------------------------------------
+        # 6) Re-capture observation
+        # ------------------------------------------------------------------
+        obs = self.get_obs()
 
-        # --- 5) Debug prints (safe) ---
-        if getattr(self, "_dbg_printed", 0) < 10:
-            self._dbg_printed = getattr(self, "_dbg_printed", 0) + 1
-            print(
-                f"[ENV-B] a_norm(min,max)=({float(a7.min()):.3f},{float(a7.max()):.3f}) "
-                f"dq(rad)(min,max)=({float(dq.min()):.3e},{float(dq.max()):.3e}) "
-                f"||dq||={float(np.linalg.norm(dq)):.3e}",
-                flush=True,
-            )
+        info = dict(info) if info is not None else {}
+        info["reset_q_start"] = q0.copy()
+        info["is_success"] = False
+        return obs, info
 
-        # ----------------------------------------------------------------------
-        # EE-to-goal distance (world frame), used for gripper schedule
-        # ----------------------------------------------------------------------
+
+    def _goal_pos_world(self):
         goal_pos = getattr(self, "goal_pos", None)
-        dist_to_goal = None
-        if goal_pos is not None:
-            goal_pos = np.asarray(goal_pos, dtype=np.float64).reshape(3)
+        if goal_pos is None:
+            return None
+        return np.asarray(goal_pos, dtype=np.float64).reshape(3)
+
+
+    def step(self, action):
+            # --- 0) Parse + validate ---
+            self._step_count += 1
+
+            a = np.asarray(action, dtype=np.float32)
+            if a.ndim == 2:
+                a = a[0]
+            a = a.reshape(-1)
+            if a.shape[0] < 7:
+                raise ValueError(f"Expected action with >=7 dims, got shape {a.shape}")
+
+            # --- 1) Build cache: qpos_adr -> joint id (once) ---
+            if not hasattr(self, "_arm_qadr_to_jid"):
+                qadr_to_jid = {}
+                for jid in range(self.model.njnt):
+                    qadr_to_jid[int(self.model.jnt_qposadr[jid])] = jid
+                self._arm_qadr_to_jid = qadr_to_jid
+
+            # --- 2) SCALING & CLAMPING (The Fix) ---
+            # Do NOT clamp normalized action to [-1, 1]. Allow policy overdrive.
+            # This preserves the direction vector if the policy outputs [2.0, 0.5] vs [1.0, 0.25].
+            a_raw = a[:7].astype(np.float64) 
+            
+            # Convert to radians (0.02 scale)
+            dq_in = a_raw * float(self.ORACLE_SCALE)
+
+            # Apply Safety Clamping in RADIANS (Physical Limits)
+            # We allow 0.05 rad (~3 deg) per step, which is looser than the dataset (0.02)
+            # to ensure the policy can correct errors without being clipped artificially.
+            SAFE_LIMIT_RAD = 0.05 
+            dq_in = np.clip(dq_in, -SAFE_LIMIT_RAD, SAFE_LIMIT_RAD)
+
+            # --- 3) If success latched: HOLD (ignore action) ---
+            if getattr(self, "_success_latched", False):
+                # Hold the frozen target, not the current position
+                q_target = getattr(self, "_q_hold", self._q_cmd).astype(np.float64, copy=False)
+                dq_applied = np.zeros_like(dq_in)
+            else:
+                # --- INTEGRATOR LOGIC ---
+                # 1. Take the previous COMMANDED target (ignoring physics lag)
+                q_prev_cmd = self._q_cmd.astype(np.float64)
+                
+                # 2. Add the delta
+                q_cmd = q_prev_cmd + dq_in
+
+                # 3. Clamp to joint limits (safety only)
+                for i, qadr in enumerate(self.arm_qpos_adr):
+                    jid = self._arm_qadr_to_jid.get(int(qadr), None)
+                    if jid is None:
+                        continue
+                    if int(self.model.jnt_limited[jid]) == 1:
+                        lo, hi = self.model.jnt_range[jid]
+                        q_cmd[i] = np.clip(q_cmd[i], lo, hi)
+
+                # 4. Update the persistent command state for the next step
+                self._q_cmd = q_cmd.astype(np.float32)
+                q_target = q_cmd.astype(np.float64, copy=False)
+                dq_applied = dq_in
+
+            # Log the actually commanded target + delta
+            self._last_q_target_cmd = q_target.astype(np.float32, copy=False).copy()
+            self._last_dq_cmd = dq_applied.astype(np.float32, copy=False).copy()
+
+            if getattr(self, "_dbg_printed", 0) < 10:
+                self._dbg_printed = getattr(self, "_dbg_printed", 0) + 1
+                print(
+                    f"[ENV-B] a_norm(min,max)=({float(a_raw.min()):.3f},{float(a_raw.max()):.3f}) "
+                    f"dq(rad)(min,max)=({float(dq_applied.min()):.3e},{float(dq_applied.max()):.3e}) "
+                    f"||dq||={float(np.linalg.norm(dq_applied)):.3e}",
+                    flush=True,
+                )
+
+            # ----------------------------------------------------------------------
+            # EE-to-goal distance (world frame), used for gripper schedule
+            # ----------------------------------------------------------------------
             ee_pos = self._ee_pos_world()
-            if ee_pos is not None:
-                dist_to_goal = float(np.linalg.norm(ee_pos - goal_pos))
+            goal_pos_world = self._goal_pos_world()
+            dist_to_goal = None
+            if ee_pos is not None and goal_pos_world is not None:
+                dist_to_goal = float(np.linalg.norm(ee_pos - goal_pos_world))
 
-        # ----------------------------------------------------------------------
-        # Gripper schedule
-        # ----------------------------------------------------------------------
-        if self.gripper_act_id >= 0:
-            if self._grip_state == "open":
-                if dist_to_goal is not None and dist_to_goal <= float(GRIPPER_CLOSE_TRIGGER_DIST_M):
-                    print(f"[GRIPPER] trigger dist={dist_to_goal:.4f} -> ramping", flush=True)
-                    self._grip_state = "ramping"
-                    self._grip_ramp_step = 0
-                self._grip_norm = GRIP_OPEN_NORM
-
-            elif self._grip_state == "ramping":
-                t = float(self._grip_ramp_step) / float(max(1, GRIPPER_RAMP_STEPS - 1))
-                self._grip_norm = float(np.clip(1.0 - t, 0.0, 1.0))
-                self._grip_ramp_step += 1
-                if self._grip_ramp_step >= int(GRIPPER_RAMP_STEPS):
-                    self._grip_state = "closed"
+            # ----------------------------------------------------------------------
+            # Gripper schedule (Logic based on dist_to_goal)
+            # ----------------------------------------------------------------------
+            if self.gripper_act_id >= 0:
+                if self._grip_state == "open":
+                    if dist_to_goal is not None and dist_to_goal <= float(GRIPPER_CLOSE_TRIGGER_DIST_M):
+                        self._grip_state = "ramping"
+                        self._grip_ramp_step = 0
+                    self._grip_norm = GRIP_OPEN_NORM
+                elif self._grip_state == "ramping":
+                    t = float(self._grip_ramp_step) / float(max(1, GRIPPER_RAMP_STEPS - 1))
+                    self._grip_norm = float(np.clip(1.0 - t, 0.0, 1.0))
+                    self._grip_ramp_step += 1
+                    if self._grip_ramp_step >= int(GRIPPER_RAMP_STEPS):
+                        self._grip_state = "closed"
+                        self._grip_norm = GRIP_CLOSE_NORM
+                else:
                     self._grip_norm = GRIP_CLOSE_NORM
 
+                grip_cmd = self._grip_cmd_from_norm(self._grip_norm)
             else:
-                self._grip_norm = GRIP_CLOSE_NORM
+                grip_cmd = None
 
-            grip_cmd = self._grip_cmd_from_norm(self._grip_norm)
-        else:
-            grip_cmd = None
+            # --- 4) Step MuJoCo: absolute target control ---
+            self._last_grip_cmd = None if grip_cmd is None else float(grip_cmd)
 
-        # --- 6) Step MuJoCo: absolute target control ---
-        self._last_q_target_cmd = q_target.copy()
-        self._last_grip_cmd = None if grip_cmd is None else float(grip_cmd)
+            for _ in range(int(self.substeps)):
+                self.data.ctrl[self.arm_act_ids] = q_target
+                if grip_cmd is not None:
+                    self.data.ctrl[self.gripper_act_id] = float(grip_cmd)
+                mujoco.mj_step(self.model, self.data)
 
-        for _ in range(int(self.substeps)):
-            self.data.ctrl[self.arm_act_ids] = q_target
-            if grip_cmd is not None:
-                self.data.ctrl[self.gripper_act_id] = float(grip_cmd)
-            mujoco.mj_step(self.model, self.data)
+            # --- 5) Post-step Evaluation ---
+            dist_post = None
+            ee_pos_post = self._ee_pos_world()
+            goal_pos_world_post = self._goal_pos_world()
+            if ee_pos_post is not None and goal_pos_world_post is not None:
+                dist_post = float(np.linalg.norm(ee_pos_post - goal_pos_world_post))
 
-        # --- 7) Compute post-step distance ---
-        dist_post = None
-        goal_pos = getattr(self, "goal_pos", None)
-        if goal_pos is not None:
-            goal_pos = np.asarray(goal_pos, dtype=np.float64).reshape(3)
-            ee_pos = self._ee_pos_world()
-            if ee_pos is not None:
-                dist_post = float(np.linalg.norm(ee_pos - goal_pos))
-                if getattr(self, "_dbg_dist_post", 0) < 50:
-                    self._dbg_dist_post = getattr(self, "_dbg_dist_post", 0) + 1
-                    print(f"[DIST_POST] {dist_post:.4f} (success_th={SUCCESS_DIST_M:.3f})", flush=True)
+            terminated = False
+            truncated = False
+            info = {"ee_goal_dist": dist_post}
 
-        # --- 8) Success latch + post-success hold + termination ---
-        terminated = False
-        truncated = False
-        info = {}
-
-        success_dist = float(SUCCESS_DIST_M)
-        success_hold_steps = int(getattr(self, "success_hold_steps", 3))
-
-        if not hasattr(self, "_success_streak"):
-            self._success_streak = 0
-        if not hasattr(self, "_success_latched"):
-            self._success_latched = False
-        if not hasattr(self, "_post_success_hold_left"):
-            self._post_success_hold_left = 0
-        if not hasattr(self, "_post_success_hold_total"):
-            self._post_success_hold_total = int(POST_SUCCESS_HOLD_STEPS)
-
-        success_just_latched = False
-
-        if dist_post is not None:
-            info["ee_goal_dist"] = dist_post
-
-            if not self._success_latched:
-                if dist_post <= success_dist:
+            # Success latching logic
+            if not hasattr(self, "_success_streak"): self._success_streak = 0
+            if not hasattr(self, "_success_latched"): self._success_latched = False
+            
+            if dist_post is not None and not self._success_latched:
+                if dist_post <= float(SUCCESS_DIST_M):
                     self._success_streak += 1
                 else:
                     self._success_streak = 0
 
-                if self._success_streak >= success_hold_steps:
+                if self._success_streak >= int(getattr(self, "success_hold_steps", 3)):
                     self._success_latched = True
-                    self._post_success_hold_total = int(POST_SUCCESS_HOLD_STEPS)
                     self._post_success_hold_left = int(POST_SUCCESS_HOLD_STEPS)
-                    success_just_latched = True
-
-                    # IMPORTANT: hold the COMMANDED target (do NOT replace with measured qpos)
-                    self._q_hold = self._q_cmd.copy()
-
-                    # Close gripper during hold (optional)
+                    self._q_hold = q_target.copy() # Freeze current integrated target
                     self._grip_state = "closed"
                     self._grip_norm = GRIP_CLOSE_NORM
 
-                    if DEBUG:
-                        print(
-                            f"[SUCCESS LATCH] step={self._step_count} dist={dist_post:.4f} "
-                            f"hold_steps={self._post_success_hold_left}",
-                            flush=True,
-                        )
+            info["is_success"] = bool(self._success_latched)
 
-        info["is_success"] = bool(self._success_latched)
+            if self._success_latched:
+                if self._post_success_hold_left > 0:
+                    self._post_success_hold_left -= 1
+                else:
+                    terminated = True
+                    info["terminated_by_success_hold"] = True
 
-        if self._success_latched:
-            # We want N additional recorded steps AFTER latch; do not decrement on latch step.
-            if not success_just_latched and self._post_success_hold_left > 0:
-                self._post_success_hold_left -= 1
+            obs = self.get_obs()
+            reward = 1.0 if info["is_success"] else 0.0
 
-            if DEBUG and self._post_success_hold_left > 0 and (self._post_success_hold_left % 5 == 0):
-                print(
-                    f"[HOLD] left={self._post_success_hold_left} dist={info.get('ee_goal_dist', float('nan')):.4f}",
-                    flush=True,
-                )
-
-            if self._post_success_hold_left <= 0 and not success_just_latched:
-                terminated = True
-                info["terminated_by_success_hold"] = True
-                info["is_success"] = True
-
-                if DEBUG:
-                    print(
-                        f"[EP END] step={self._step_count} done=True dist={info.get('ee_goal_dist', float('nan')):.4f} success=True",
-                        flush=True,
-                    )
-
-        # --- 9) Return Gym API ---
-        obs = self.get_obs()
-        reward = 1.0 if info.get("is_success", False) else 0.0
-
-        if getattr(self, "_debug_step_count", 0) < 5:
-            self._debug_step_count = getattr(self, "_debug_step_count", 0) + 1
-            q_sim = self.data.qpos[self.arm_qpos_adr]
-            print(
-                f"[STEP-B {self._debug_step_count}] "
-                f"|q_target-q_sim|={np.linalg.norm(q_target - q_sim):.3e} "
-                f"q0={q_sim[0]:.3f} "
-                f"dist={info.get('ee_goal_dist', float('nan')):.4f} "
-                f"streak={getattr(self, '_success_streak', 0)}",
-                flush=True,
-            )
-
-        return obs, reward, terminated, truncated, info
-
-
-    def set_goal_pos(self, goal_pos_world):
-        self.goal_pos = np.asarray(goal_pos_world, dtype=np.float64).reshape(3)
-        if hasattr(self, "_env") and hasattr(self._env, "set_goal_pos"):
-            self._env.set_goal_pos(self.goal_pos)
+            return obs, reward, terminated, truncated, info
+    
+    def _goal_pos_world(self):
+        goal_pos = getattr(self, "goal_pos", None)
+        if goal_pos is not None:
+            return np.asarray(goal_pos, dtype=np.float64).reshape(3)
+        bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "goal_mocap")
+        if bid >= 0:
+            return self.data.xpos[bid].copy()
+        return None
 
 
     def get_obs(self):
@@ -857,7 +832,7 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
             
             # ... (wrist camera code remains the same) ...
             try:
-                self._renderer.update_scene(self.data, camera="wrist_cam")
+                self._renderer.update_scene(self.data, camera="gripper_cam")
                 img_wrist_raw = self._renderer.render()
                 image_wrist = img_wrist_raw[::2, ::2]
             except Exception:
@@ -869,12 +844,15 @@ class DirectControlPandaEnv(PandaTomatoSimEnv):
             # We approximate finger joint positions using the same normalized open/close
             # used for actuator control: open≈0.04, closed≈0.0.
             if self.proprio_dim > 7:
-                # We have 7 arm joints. The remaining (proprio_dim - 7) are gripper fingers.
-                # 0.04 is the raw joint position for an OPEN Panda gripper.
-                gripper_open_val = 0.00
+                # CHANGE: The dataset expects a value that normalizes to ~-0.79.
+                # Forcing 0.04 (Open) resulted in ~8.26. 
+                # Try 0.0 for the start val to align with the dataset's 'ds' mean.
+                gripper_start_val = 0.00  # Adjust this to reduce the 'diff' in your logs
                 gripper_closed_val = 0.0
+                
                 g = float(np.clip(getattr(self, "_grip_norm", GRIP_OPEN_NORM), 0.0, 1.0))
-                gripper_val = float(gripper_closed_val + g * (gripper_open_val - gripper_closed_val))
+                # If starting at 0.0, ensure your linear interpolation reflects that
+                gripper_val = float(gripper_closed_val + g * (gripper_start_val - gripper_closed_val))
                 gripper_state = np.full((self.proprio_dim - 7,), gripper_val, dtype=np.float32)
 
                 proprio = np.concatenate([qpos_arm[:7], gripper_state], axis=0)
@@ -1064,33 +1042,23 @@ def main(_):
         import random 
         num_eval_episodes = 1 
 
+        top_targets = None
+        current_seed = None
+        dynamic_xml_path = None
+
         for episode_index in range(num_eval_episodes):
-            
-            traj_idx = int(FLAGS.dataset_trajectory_index)
-
-            if FLAGS.match_dataset_scene:
-                current_seed = traj_idx
-                logging.info(
-                    f"MATCHING DATASET: Regenerating scene for traj_idx={traj_idx} (seed={current_seed})"
-                )
-            else:
-                current_seed = np.random.randint(0, 100000)
-                logging.info(f"DYNAMIC: Generating new random scene (Seed {current_seed})")
-
-            np.random.seed(current_seed)
-            random.seed(current_seed)
-            print(f"[SEED CHECK] traj_idx={traj_idx} seed={current_seed}", flush=True)
-
-            # 2. PREPARE DEBUG ACTIONS (If flag is set)
-            gt_actions_queue = []
-            need_dataset_actions = FLAGS.debug_use_dataset_actions or (FLAGS.policy_start_timestep > 0)
+            plant_index = episode_index // EPISODES_PER_PLANT
+            episode_within_plant = episode_index % EPISODES_PER_PLANT
 
             traj_idx = int(FLAGS.dataset_trajectory_index)
-            traj_for_eval = get_trajectory_by_index(raw_ds, traj_idx)
+
             goal_primary_img = None
             goal_wrist_img = None
             ds_actions = None
             ds_proprio0 = None
+            gt_actions_queue = []
+
+            traj_for_eval = get_trajectory_by_index(raw_ds, traj_idx)
             if isinstance(traj_for_eval, dict) and "observation" in traj_for_eval:
                 goal_primary_img = traj_for_eval["observation"].get("goal_image_primary")
                 goal_wrist_img = traj_for_eval["observation"].get("goal_image_wrist")
@@ -1103,39 +1071,43 @@ def main(_):
                 if "proprio" in traj_for_eval["observation"]:
                     ds_proprio0 = np.asarray(traj_for_eval["observation"]["proprio"][0], dtype=np.float32)
 
+            need_dataset_actions = FLAGS.debug_use_dataset_actions or (FLAGS.policy_start_timestep > 0)
             if need_dataset_actions:
                 logging.warning(
                     f"Loading dataset actions for episode {episode_index} "
                     f"(debug_use_dataset_actions={FLAGS.debug_use_dataset_actions}, "
                     f"policy_start_timestep={FLAGS.policy_start_timestep})"
                 )
-                traj = traj_for_eval
-
-                actions = np.asarray(traj["action"])  # [T, >=7]
-                K = min(100, actions.shape[0])
-                a = actions[:K]
-                print(
-                    "[DATA actions] shape=", a.shape,
-                    "min=", float(a.min()),
-                    "max=", float(a.max()),
-                    "mean(abs)=", float(np.mean(np.abs(a))),
-                    "p99(abs)=", float(np.quantile(np.abs(a), 0.99)),
-                    flush=True,
-                )
-
-                gt_actions_queue = list(traj["action"])
+                gt_actions_queue = list(traj_for_eval["action"])
                 logging.info(f"Loaded {len(gt_actions_queue)} steps of ground-truth actions.")
 
+            if episode_within_plant == 0:
+                if FLAGS.match_dataset_scene:
+                    current_seed = traj_idx + plant_index
+                    logging.info(
+                        f"MATCHING DATASET: Regenerating scene for traj_idx={traj_idx} (seed={current_seed})"
+                    )
+                else:
+                    current_seed = np.random.randint(0, 100000)
+                    logging.info(f"DYNAMIC: Generating new random scene (Seed {current_seed})")
+
+                np.random.seed(current_seed)
+                random.seed(current_seed)
+                print(f"[SEED CHECK] traj_idx={traj_idx} seed={current_seed}", flush=True)
+
             # 3. REGENERATE SCENE XML
-            sim_env_module.START_JOINTS = np.asarray(DATASET_START_JOINTS, dtype=float)
-            model_xml_path = Path(os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH))
-            try:
-                from record_dataset.helpers import build_and_load_scene, scene_dir_from_model_path
-                build_and_load_scene(str(model_xml_path))
-                scene_dir = Path(scene_dir_from_model_path(str(model_xml_path)))
-                dynamic_xml_path = scene_dir / "scene_dynamic.xml"
-            except ImportError:
-                raise RuntimeError("record_dataset.helpers not found")
+            if episode_within_plant == 0:
+                sim_env_module.START_JOINTS = np.asarray(DATASET_START_JOINTS, dtype=float)
+                model_xml_path = Path(os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH))
+                try:
+                    from record_dataset.helpers import build_and_load_scene, scene_dir_from_model_path
+                    build_and_load_scene(str(model_xml_path))
+                    scene_dir = Path(scene_dir_from_model_path(str(model_xml_path)))
+                    dynamic_xml_path = scene_dir / "scene_dynamic.xml"
+                except ImportError:
+                    raise RuntimeError("record_dataset.helpers not found")
+            if dynamic_xml_path is None:
+                raise RuntimeError("dynamic_xml_path not set; scene generation failed")
 
             # 4. BUILD ENV
             # Pass the detected proprio dim here!
@@ -1150,19 +1122,27 @@ def main(_):
             # --- SET GOAL FROM SIM (tomato pose) ---
             mujoco.mj_forward(panda_env.model, panda_env.data)  # ensure xpos/xmat are current
 
-            top_targets = find_side_stem_targets(
-                panda_env.model,
-                panda_env.data,
-                k=EPISODES_PER_PLANT,
-                s=0.66,
-            )
+            if episode_within_plant == 0 or top_targets is None:
+                top_targets = find_side_stem_targets(
+                    panda_env.model,
+                    panda_env.data,
+                    k=EPISODES_PER_PLANT,
+                    s=0.5,
+                )
+                if DEBUG:
+                    print(f"[TARGETS] top={top_targets}", flush=True)
             if not top_targets:
                 raise RuntimeError("find_side_stem_targets returned empty; scene naming mismatch?")
 
             stem_name, goal_pos_world, approach_xy, truss_name = top_targets[
-                episode_index % len(top_targets)
+                episode_within_plant % len(top_targets)
             ]
             goal_pos_world = np.asarray(goal_pos_world, dtype=np.float64)
+            if DEBUG:
+                print(
+                    f"[TARGET] stem={stem_name} goal_pos_world={goal_pos_world}",
+                    flush=True,
+                )
 
             panda_env.set_goal_pos(goal_pos_world)
             panda_env.goal_pos = goal_pos_world
@@ -1174,6 +1154,7 @@ def main(_):
                     mujoco.mj_forward(panda_env.model, panda_env.data)
 
             print("[CHECK] panda_env.goal_pos =", panda_env.goal_pos)
+
             # ---------------------------------------
 
 
@@ -1192,22 +1173,6 @@ def main(_):
             env = GoalImageObsWrapper(env, goal_primary=goal_primary_img, goal_wrist=goal_wrist_img)
             env = EnsureOctoObsKeysWrapper(env)     
             env = RHCWrapper(env, exec_horizon=1)
-
-            # --- RATE AUDIT (oracle-compatible outer-step pacing) ---
-            timestep = float(panda_env.model.opt.timestep)
-            substeps_calc = int(panda_env.substeps)
-            action_dt = timestep * float(substeps_calc)
-            hz = 1.0 / max(action_dt, 1e-9)
-            print(
-                f"[RATE AUDIT] target_action_dt={float(panda_env.TARGET_ACTION_DT):.3f}s "
-                f"timestep={timestep:.6f}s substeps={substeps_calc} "
-                f"action_dt={action_dt:.6f}s hz={hz:.2f}",
-                flush=True,
-            )
-            print(
-                f"[RATE AUDIT] dataset metadata action_dt_sec={float(panda_env.TARGET_ACTION_DT):.3f}",
-                flush=True,
-            )
 
 
             
@@ -1326,12 +1291,10 @@ def main(_):
 
                 episode_return = 0.0
                 step_count = 0
-                step_call_count = 0
                 last_step_type = None
                 last_ee_goal_dist = None
-                away_steps = 0
                 min_ee_goal_dist = None
-                termination_reason = "max_steps"
+                away_steps = 0
 
                 # --- DEBUG ARRAYS ---
                 t_list = []
@@ -1382,7 +1345,7 @@ def main(_):
                         # Temporarily STOP the robot to read the numbers without breaking hardware
                         # import sys; sys.exit()
                         
-                    # policy_chunk: shape (H, 7) normalized deltas (same representation as dataset actions)
+                    # policy_chunk: shape (H, 7) normalized deltas (same as dataset actions)
                     delta_norm = policy_chunk[0][:7].astype(np.float32)
 
                     a_pi = None
@@ -1401,18 +1364,22 @@ def main(_):
                         a = delta_norm
                         print(f"[{src} ACTION APPLY]", step_count,
                             "a_norm min/max:", float(a.min()), float(a.max()),
-                            "dq(rad) min/max:", float((a*0.02).min()), float((a*0.02).max()),
+                            f"dq(rad) min/max: {float((a*0.02).min()):.3e}/{float((a*0.02).max()):.3e}",
                             flush=True)
    
 
                     obs, reward, done, trunc, info = env.step(delta_norm)
-                    step_call_count += 1
-                    if step_call_count != (step_count + 1):
-                        print(
-                            f"[RATE AUDIT] WARNING: env.step called {step_call_count}x "
-                            f"by outer step {step_count + 1}",
-                            flush=True,
-                        )
+                    #debug
+                    panda = env.unwrapped.panda_env
+                    ee = panda._ee_pos_world()
+                    goal_world = panda.goal_pos
+                    if goal_world is not None:
+                        dist_true = np.linalg.norm(ee - goal_world)
+                    else:
+                        dist_true = float("nan")
+                    print("[DIST TRUE]", step_count, dist_true, "grip_state", panda._grip_state, "grip_norm", panda._grip_norm)
+
+                   
                     is_success_now = bool(info.get("is_success", False))
                     last_step_type = _extract_step_type(info, done, trunc)
                     if DEBUG_TERM:
@@ -1458,7 +1425,6 @@ def main(_):
                         ever_within_success = (min_ee_goal_dist is not None) and (min_ee_goal_dist <= float(SUCCESS_DIST_M))
                         if (not ever_within_success) and away_steps >= int(AWAY_STEPS):
                             info["terminated_by_away"] = True
-                            termination_reason = "drifting_away"
                             print(
                                 f"[EVAL TERM] t={step_count} terminated_by_away "
                                 f"dist={ee_goal_dist:.4f} min_dist={float(min_ee_goal_dist):.4f}",
@@ -1551,12 +1517,7 @@ def main(_):
                     episode_return += reward
                     # print("[STOP CHECK] step_count=", step_count, "len(actions)=", len(gt_actions_queue), flush=True)
 
-                    if done or trunc:
-                        if min_ee_goal_dist is not None and min_ee_goal_dist <= float(SUCCESS_DIST_M):
-                            termination_reason = "success_dist_reached"
-                        else:
-                            termination_reason = "env_done_or_trunc"
-                        break
+                    if done or trunc: break
                 
                 print(f"Episode return: {episode_return}")
                 hold_steps_used = _hold_steps_used(env)
@@ -1691,7 +1652,6 @@ def main(_):
 
                 print("\n[FINAL SUMMARY]")
                 print(f"final_dist={final_dist:.4f} min_dist={min_dist:.4f} min_dist_step={min_dist_step}")
-                print(f"termination_reason={termination_reason}")
                 print(
                     f"policy_action_norm mean/median={pi_norm_mean:.3e}/{pi_norm_median:.3e} "
                     f"ratio_vs_dataset_mean={norm_ratio:.3f}"
